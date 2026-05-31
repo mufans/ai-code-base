@@ -52,8 +52,9 @@ class SkillGenerator:
             if skill_content:
                 # Auto-verify
                 verification = self._auto_verify_skill(repo_name, skill_content)
-                # Add YAML frontmatter
-                skill_content = self._add_skill_frontmatter(candidate, verification)
+                # Add YAML frontmatter (prepend to body, preserving body content)
+                frontmatter = self._add_skill_frontmatter(candidate, verification)
+                skill_content = frontmatter + skill_content
                 self.doc_store.write_skill(repo_name, candidate["name"], skill_content)
 
                 generated.append({
@@ -217,10 +218,18 @@ Output in Markdown format. Use backticks for code references."""
             if provider_config:
                 model = provider_config.model or "gpt-4o-mini"
 
-            response = await litellm.acompletion(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            # Build kwargs for litellm, using llm_client dict if available
+            kwargs = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if isinstance(llm_client, dict):
+                if llm_client.get("api_base"):
+                    kwargs["api_base"] = llm_client["api_base"]
+                if llm_client.get("api_key"):
+                    kwargs["api_key"] = llm_client["api_key"]
+
+            response = await litellm.acompletion(**kwargs)
             content = response.choices[0].message.content
             if content.startswith("```"):
                 content = re.sub(r'^```\w*\n?', '', content)

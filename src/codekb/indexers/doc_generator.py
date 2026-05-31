@@ -128,11 +128,17 @@ README:
 """
         try:
             import litellm
-            response = await litellm.acompletion(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-            )
+            kwargs = {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            }
+            if isinstance(llm_client, dict):
+                if llm_client.get("api_base"):
+                    kwargs["api_base"] = llm_client["api_base"]
+                if llm_client.get("api_key"):
+                    kwargs["api_key"] = llm_client["api_key"]
+            response = await litellm.acompletion(**kwargs)
             result = json.loads(response.choices[0].message.content)
             coverage = {
                 "total_dimensions": 8,
@@ -256,10 +262,18 @@ class DocGenerator:
             if provider_config:
                 model = provider_config.model or "gpt-4o-mini"
 
-            response = await litellm.acompletion(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-            )
+            # Build kwargs for litellm, using llm_client dict if available
+            kwargs = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if isinstance(llm_client, dict):
+                if llm_client.get("api_base"):
+                    kwargs["api_base"] = llm_client["api_base"]
+                if llm_client.get("api_key"):
+                    kwargs["api_key"] = llm_client["api_key"]
+
+            response = await litellm.acompletion(**kwargs)
             content = response.choices[0].message.content
             # Strip markdown code block if present
             if content.startswith("```"):

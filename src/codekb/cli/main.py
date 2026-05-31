@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from codekb import __version__
-from codekb.core.config import CodekbYamlConfig, ensure_data_dir, get_data_dir, load_config
+from codekb.core.config import CodekbYamlConfig, Settings, ensure_data_dir, get_data_dir, load_config, load_settings
 from codekb.core.repo_manager import RepoManager
 from codekb.core.indexer import IndexOrchestrator
 from codekb.storage.doc_store import DocStore
@@ -47,6 +47,30 @@ def _get_services(config: Optional[CodekbYamlConfig] = None):
     doc_store = DocStore(data_dir / "generated")
     repo_manager = RepoManager(config, store)
     return config, store, vector_store, doc_store, repo_manager
+
+
+def _create_llm_client(config: CodekbYamlConfig, settings: Settings) -> Optional[dict]:
+    """Create an LLM client config dict from config + settings.
+
+    Returns a dict with 'model', 'api_base', 'api_key' or None if no LLM configured.
+    """
+    provider_name = config.assignments.doc_generation
+    provider_config = config.llm_providers.get(provider_name)
+    if provider_config is None:
+        return None
+
+    api_key = settings.OPENAI_API_KEY
+    # litellm uses DEEPSEEK_API_KEY env var for deepseek models
+    # but we can pass api_key explicitly
+    import os
+    if "deepseek" in (provider_config.model or "").lower():
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or settings.OPENAI_API_KEY
+
+    return {
+        "model": provider_config.model or "gpt-4o-mini",
+        "api_base": provider_config.base_url,
+        "api_key": api_key,
+    }
 
 
 @app.command()
@@ -213,11 +237,15 @@ def docs_generate(name: str):
     from codekb.indexers.doc_generator import DocGenerator
 
     config, store, vector_store, doc_store, repo_manager = _get_services()
+    settings = load_settings()
+    llm_client = _create_llm_client(config, settings)
     generator = DocGenerator(store, doc_store, config)
 
     async def _generate():
         console.print(f"Generating docs for [bold]{name}[/bold]...")
-        result = await generator.generate_docs(name)
+        if llm_client:
+            console.print(f"  Using LLM: [bold]{llm_client['model']}[/bold]")
+        result = await generator.generate_docs(name, llm_client=llm_client)
         console.print(f"[green]Done[/green]: {result}")
 
     asyncio.run(_generate())
@@ -289,11 +317,15 @@ def skills_generate(name: str):
     from codekb.indexers.skill_generator import SkillGenerator
 
     config, store, vector_store, doc_store, repo_manager = _get_services()
+    settings = load_settings()
+    llm_client = _create_llm_client(config, settings)
     sg = SkillGenerator(store, doc_store, config)
 
     async def _generate():
         console.print(f"Generating skills for [bold]{name}[/bold]...")
-        result = await sg.generate_skills(name)
+        if llm_client:
+            console.print(f"  Using LLM: [bold]{llm_client['model']}[/bold]")
+        result = await sg.generate_skills(name, llm_client=llm_client)
         if not result:
             console.print("No skills generated.")
             return

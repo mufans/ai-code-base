@@ -71,9 +71,9 @@ class OpenAIEmbeddingProvider:
         return result[0]
 
 
-def _chunk_id(repo_name: str, file_path: str, name: str, kind: str) -> str:
+def _chunk_id(repo_name: str, file_path: str, name: str, kind: str, start_line: int = 0) -> str:
     """Generate a deterministic chunk ID."""
-    raw = f"{repo_name}:{file_path}:{name}:{kind}"
+    raw = f"{repo_name}:{file_path}:{name}:{kind}:{start_line}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
@@ -90,7 +90,7 @@ def chunk_symbols(symbols: list[Symbol]) -> list[CodeChunk]:
         if not sym.source:
             continue
         chunk = CodeChunk(
-            id=_chunk_id(sym.repo_name, sym.file_path, sym.name, sym.kind),
+            id=_chunk_id(sym.repo_name, sym.file_path, sym.name, sym.kind, sym.start_line),
             repo_name=sym.repo_name,
             file_path=sym.file_path,
             name=sym.name,
