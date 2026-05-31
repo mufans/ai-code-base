@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codekb"
+version = "0.1.0"
+description = "Universal code knowledge base with MCP server for AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "aiosqlite>=0.20",
+    "chromadb>=0.5",
+    "tree-sitter>=0.23",
+    "sentence-transformers>=3.0",
+    "litellm>=1.40",
+    "mcp[cli]>=1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "gitpython>=3.1",
+    "rich>=13.0",
+]
+
+[project.scripts]
+codekb = "codekb.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codekb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+]
