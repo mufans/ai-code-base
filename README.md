@@ -1,5 +1,7 @@
 # CodeKB
 
+English | [中文](README_CN.md)
+
 Universal code knowledge base that indexes 100+ code repositories and provides MCP server tools for AI agents (Claude Code, Cursor, etc.) to query code, documentation, architecture, and generate code.
 
 ## Architecture
