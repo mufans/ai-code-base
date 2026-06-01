@@ -14,6 +14,8 @@ from codekb.core.config import CodekbYamlConfig, ensure_data_dir, load_config, l
 from codekb.core.indexer import IndexOrchestrator
 from codekb.core.repo_manager import RepoManager
 from codekb.indexers.embedder import create_embedding_provider
+from codekb.mcp.guide_cache import GuideCache
+from codekb.retrieval.guide_generator import GuideGenerator
 from codekb.retrieval.hybrid_search import HybridSearch
 from codekb.retrieval.reference_builder import ReferenceBuilder
 from codekb.retrieval.semantic_search import SemanticSearch
@@ -36,6 +38,33 @@ def _get_services(config: Optional[CodekbYamlConfig] = None):
     return config, settings, store, vector_store, doc_store, repo_manager
 
 
+def _create_llm_client_dict(config: CodekbYamlConfig, settings) -> Optional[dict]:
+    """Create an LLM client config dict for guide tools."""
+    import os
+    provider_name = config.assignments.doc_generation
+    provider_config = config.llm_providers.get(provider_name)
+    if provider_config is None:
+        return None
+
+    api_key = settings.OPENAI_API_KEY
+    model = provider_config.model or "gpt-4o-mini"
+    api_base = provider_config.base_url
+
+    provider_type = provider_config.provider.lower()
+    if provider_type == "openai" and api_base:
+        if "deepseek" in (model or "").lower() or "deepseek" in (api_base or "").lower():
+            api_key = os.environ.get("DEEPSEEK_API_KEY") or settings.OPENAI_API_KEY
+            model = f"openai/{model}"
+    elif "deepseek" in (model or "").lower():
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or settings.OPENAI_API_KEY
+
+    return {
+        "model": model,
+        "api_base": api_base,
+        "api_key": api_key,
+    }
+
+
 def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
     """Create and configure the MCP server with all tools and resources."""
     config, settings, store, vector_store, doc_store, repo_manager = _get_services(config)
@@ -48,6 +77,8 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
     structure_query = StructureQuery(store)
     hybrid_search = HybridSearch(semantic_search, store)
     reference_builder = ReferenceBuilder(store, structure_query, hybrid_search)
+    guide_cache = GuideCache(store)
+    guide_generator = GuideGenerator(store, guide_cache)
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
@@ -251,6 +282,60 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                     "required": ["repo_name", "file_path"],
                 },
             ),
+            types.Tool(
+                name="get_component_guide",
+                description="Get a component usage guide: properties, methods, usage example, and related symbols. Returns complete guide in one call.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "symbol_name": {"type": "string", "description": "Component/class name"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                    },
+                    "required": ["repo_name", "symbol_name"],
+                },
+            ),
+            types.Tool(
+                name="get_usage_examples_v2",
+                description="Find real usage examples of a symbol in calling code, excluding its own definition file.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "symbol_name": {"type": "string", "description": "Symbol name to find usages for"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                        "top_k": {"type": "integer", "description": "Max examples (default 5)", "default": 5},
+                    },
+                    "required": ["repo_name", "symbol_name"],
+                },
+            ),
+            types.Tool(
+                name="recommend_component",
+                description="Recommend components matching a natural language requirement description. Supports Chinese and English.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "requirement": {"type": "string", "description": "Requirement description (Chinese or English)"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                        "top_k": {"type": "integer", "description": "Max recommendations (default 3)", "default": 3},
+                    },
+                    "required": ["repo_name", "requirement"],
+                },
+            ),
+            types.Tool(
+                name="get_api_guide",
+                description="Get an API/library integration guide with import statements, component list, setup steps, and code example.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "library_name": {"type": "string", "description": "Library or module name"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                    },
+                    "required": ["repo_name", "library_name"],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -258,7 +343,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
         try:
             result = await _handle_tool(name, arguments, store, vector_store, doc_store,
                                          repo_manager, structure_query, hybrid_search,
-                                         reference_builder, config)
+                                         reference_builder, config, guide_generator)
             return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
         except Exception as e:
             return [types.TextContent(type="text", text=json.dumps({"error": str(e)}))]
@@ -352,6 +437,7 @@ async def _handle_tool(
     hybrid_search: HybridSearch,
     reference_builder: ReferenceBuilder,
     config: CodekbYamlConfig,
+    guide_generator: GuideGenerator,
 ) -> dict | list:
     if name == "list_repos":
         repos = store.list_repos()
@@ -422,11 +508,22 @@ async def _handle_tool(
         ]
 
     elif name == "get_structure":
-        return structure_query.get_structure(
+        result = structure_query.get_structure(
             arguments["repo_name"],
             path=arguments.get("path"),
             repo_module=arguments.get("module"),
         )
+        # Truncate large results to avoid exceeding token limits
+        if isinstance(result, list) and len(result) > 20:
+            total = len(result)
+            result = result[:20]
+            result.append({
+                "file": f"... and {total - 20} more files",
+                "symbols": [],
+                "truncated": True,
+                "hint": "Use 'path' or 'module' parameter to narrow results",
+            })
+        return result
 
     elif name == "get_symbol_detail":
         return structure_query.get_symbol_detail(
@@ -525,6 +622,40 @@ async def _handle_tool(
             "title": entry["title"],
             "content": content,
         }
+
+    elif name == "get_component_guide":
+        return await guide_generator.get_component_guide(
+            arguments["repo_name"],
+            arguments["symbol_name"],
+            module=arguments.get("module"),
+            llm_client=_create_llm_client_dict(config, load_settings()),
+        )
+
+    elif name == "get_usage_examples_v2":
+        return await guide_generator.get_usage_examples(
+            arguments["repo_name"],
+            arguments["symbol_name"],
+            module=arguments.get("module"),
+            top_k=arguments.get("top_k", 5),
+            llm_client=_create_llm_client_dict(config, load_settings()),
+        )
+
+    elif name == "recommend_component":
+        return await guide_generator.recommend_component(
+            arguments["repo_name"],
+            arguments["requirement"],
+            module=arguments.get("module"),
+            top_k=arguments.get("top_k", 3),
+            llm_client=_create_llm_client_dict(config, load_settings()),
+        )
+
+    elif name == "get_api_guide":
+        return await guide_generator.get_api_guide(
+            arguments["repo_name"],
+            arguments["library_name"],
+            module=arguments.get("module"),
+            llm_client=_create_llm_client_dict(config, load_settings()),
+        )
 
     else:
         return {"error": f"Unknown tool: {name}"}
