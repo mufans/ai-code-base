@@ -424,3 +424,32 @@ class TestDocStore:
         doc_store.write_skill("test-repo", "skill1", "content")
         assert doc_store.delete_repo("test-repo") is True
         assert doc_store.list_docs("test-repo") == []
+
+
+class TestGuideCache:
+    def test_cache_miss_returns_none(self, sqlite_store):
+        result = sqlite_store.get_guide_cache("test-repo", "component_guide", "Foo")
+        assert result is None
+
+    def test_cache_write_and_read(self, sqlite_store):
+        sqlite_store.set_guide_cache("test-repo", "component_guide", "Foo", '{"name":"Foo"}')
+        result = sqlite_store.get_guide_cache("test-repo", "component_guide", "Foo")
+        assert result == '{"name":"Foo"}'
+
+    def test_cache_upsert(self, sqlite_store):
+        sqlite_store.set_guide_cache("test-repo", "component_guide", "Foo", '{"v":1}')
+        sqlite_store.set_guide_cache("test-repo", "component_guide", "Foo", '{"v":2}')
+        result = sqlite_store.get_guide_cache("test-repo", "component_guide", "Foo")
+        assert result == '{"v":2}'
+
+    def test_cache_clear_by_repo(self, sqlite_store):
+        sqlite_store.set_guide_cache("repo-a", "component_guide", "Foo", '{"a":1}')
+        sqlite_store.set_guide_cache("repo-b", "component_guide", "Bar", '{"b":2}')
+        sqlite_store.clear_guide_cache("repo-a")
+        assert sqlite_store.get_guide_cache("repo-a", "component_guide", "Foo") is None
+        assert sqlite_store.get_guide_cache("repo-b", "component_guide", "Bar") == '{"b":2}'
+
+    def test_cache_with_module(self, sqlite_store):
+        sqlite_store.set_guide_cache("test-repo", "component_guide", "Foo", '{"x":1}', module="biz_ui")
+        assert sqlite_store.get_guide_cache("test-repo", "component_guide", "Foo") is None
+        assert sqlite_store.get_guide_cache("test-repo", "component_guide", "Foo", module="biz_ui") == '{"x":1}'

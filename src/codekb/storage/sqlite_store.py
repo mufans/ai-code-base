@@ -6,7 +6,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 from pydantic import BaseModel
 
@@ -88,6 +88,13 @@ class FileEntry(BaseModel):
 class SqliteStore:
     """Manages two SQLite databases: metadata.db and structure.db."""
 
+    _IGNORED_DIRS: ClassVar[frozenset[str]] = frozenset({
+        ".git", ".hg", ".svn",
+        "node_modules", "build", "dist", "out",
+        ".venv", "__pycache__",
+        "oh_modules",
+    })
+
     def __init__(self, index_dir: Path):
         self.index_dir = index_dir
         self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +148,9 @@ class SqliteStore:
 
         # Ensure doc_index table exists (idempotent migration)
         self._ensure_doc_index_table()
+
+        # Ensure guide_cache table exists
+        self._ensure_guide_cache_table()
 
         # structure.db
         conn = self._connect(self._struct_path)
@@ -256,6 +266,8 @@ class SqliteStore:
 
     def remove_repo(self, name: str) -> bool:
         conn = self._connect(self._meta_path)
+        # Delete dependent records first to satisfy FOREIGN KEY constraints
+        conn.execute("DELETE FROM index_status WHERE repo_name = ?", (name,))
         cursor = conn.execute("DELETE FROM repos WHERE name = ?", (name,))
         affected = cursor.rowcount
         conn.commit()
@@ -275,6 +287,17 @@ class SqliteStore:
         )
         conn.commit()
         conn.close()
+
+    def get_index_status(self, repo_name: str) -> list[dict]:
+        """Get index status records for a repo. Returns empty list if never indexed."""
+        conn = self._connect(self._meta_path)
+        cursor = conn.execute(
+            "SELECT phase, status FROM index_status WHERE repo_name = ?",
+            (repo_name,),
+        )
+        results = [{"phase": row[0], "status": row[1]} for row in cursor.fetchall()]
+        conn.close()
+        return results
 
     # --- Symbol operations ---
 
@@ -299,8 +322,16 @@ class SqliteStore:
         params: list = [repo_name]
 
         if file_path:
-            query += " AND file_path = ?"
-            params.append(file_path)
+            # Support both exact file match and directory prefix match
+            if '.' in Path(file_path).name:
+                # Has extension → exact file match
+                query += " AND file_path = ?"
+                params.append(file_path)
+            else:
+                # No extension → directory prefix match
+                query += " AND (file_path = ? OR file_path LIKE ?)"
+                params.append(file_path)
+                params.append(file_path + "/%")
         if repo_module is not None:
             query += " AND repo_module = ?"
             params.append(repo_module)
@@ -501,10 +532,30 @@ class SqliteStore:
         conn.commit()
         conn.close()
 
+    def _ensure_guide_cache_table(self):
+        """Create guide_cache table if it doesn't exist (idempotent)."""
+        conn = self._connect(self._meta_path)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS guide_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_name TEXT NOT NULL,
+                tool_type TEXT NOT NULL,
+                query_key TEXT NOT NULL,
+                module TEXT DEFAULT '',
+                result_json TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(repo_name, tool_type, query_key, module)
+            );
+            CREATE INDEX IF NOT EXISTS idx_guide_cache_lookup
+                ON guide_cache(repo_name, tool_type, query_key, module);
+        """)
+        conn.commit()
+        conn.close()
+
     @staticmethod
     def _detect_doc_type(file_path: str) -> str:
         """Auto-detect doc type from file path."""
-        name = file_path.upper()
         basename = Path(file_path).name.upper()
         if basename in ("README.MD", "README.RST", "README.TXT", "README"):
             return "readme"
@@ -515,7 +566,7 @@ class SqliteStore:
         if basename == "ARCHITECTURE.MD":
             return "architecture"
         parts = Path(file_path).parts
-        if parts and parts[0].lower() == "docs":
+        if any(p.lower() == "docs" for p in parts):
             return "docs"
         return "other"
 
@@ -535,7 +586,7 @@ class SqliteStore:
         return ""
 
     def index_docs(self, repo_name: str, repo_path: Path) -> int:
-        """Scan and index md documents in a repo. Returns count of indexed docs."""
+        """Recursively scan and index md documents in a repo. Returns count of indexed docs."""
         conn = self._connect(self._struct_path)
 
         # Delete existing entries for this repo
@@ -543,26 +594,16 @@ class SqliteStore:
 
         md_files: list[tuple[str, str, str, int, str]] = []
 
-        # 1. Root-level md files
-        for item in repo_path.iterdir():
-            if item.is_file() and item.suffix.lower() == ".md":
-                rel_path = item.name
-                full_path = str(item)
-                doc_type = self._detect_doc_type(rel_path)
-                title = self._extract_title(item)
-                size = item.stat().st_size
-                md_files.append((rel_path, full_path, doc_type, size, title))
-
-        # 2. docs/ directory recursive scan
-        docs_dir = repo_path / "docs"
-        if docs_dir.is_dir():
-            for md_file in docs_dir.rglob("*.md"):
-                rel_path = str(md_file.relative_to(repo_path))
-                full_path = str(md_file)
-                doc_type = self._detect_doc_type(rel_path)
-                title = self._extract_title(md_file)
-                size = md_file.stat().st_size
-                md_files.append((rel_path, full_path, doc_type, size, title))
+        for md_file in repo_path.rglob("*.md"):
+            # Skip files inside ignored directories
+            if any(part in self._IGNORED_DIRS for part in md_file.relative_to(repo_path).parts):
+                continue
+            rel_path = str(md_file.relative_to(repo_path))
+            full_path = str(md_file)
+            doc_type = self._detect_doc_type(rel_path)
+            title = self._extract_title(md_file)
+            size = md_file.stat().st_size
+            md_files.append((rel_path, full_path, doc_type, size, title))
 
         now = datetime.now(timezone.utc).isoformat()
         conn.executemany(
@@ -621,6 +662,40 @@ class SqliteStore:
                         pass  # Column already exists
             conn.commit()
             conn.close()
+
+    # --- Guide cache operations ---
+
+    def get_guide_cache(self, repo_name: str, tool_type: str, query_key: str,
+                        module: str = "") -> Optional[str]:
+        """Get cached guide result. Returns result_json string or None."""
+        conn = self._connect(self._meta_path)
+        row = conn.execute(
+            "SELECT result_json FROM guide_cache WHERE repo_name=? AND tool_type=? AND query_key=? AND module=?",
+            (repo_name, tool_type, query_key, module),
+        ).fetchone()
+        conn.close()
+        return row["result_json"] if row else None
+
+    def set_guide_cache(self, repo_name: str, tool_type: str, query_key: str,
+                        result_json: str, module: str = ""):
+        """Insert or update a guide cache entry."""
+        conn = self._connect(self._meta_path)
+        conn.execute(
+            """INSERT INTO guide_cache (repo_name, tool_type, query_key, module, result_json, updated_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(repo_name, tool_type, query_key, module)
+               DO UPDATE SET result_json=excluded.result_json, updated_at=datetime('now')""",
+            (repo_name, tool_type, query_key, module, result_json),
+        )
+        conn.commit()
+        conn.close()
+
+    def clear_guide_cache(self, repo_name: str):
+        """Clear all guide cache entries for a repo."""
+        conn = self._connect(self._meta_path)
+        conn.execute("DELETE FROM guide_cache WHERE repo_name = ?", (repo_name,))
+        conn.commit()
+        conn.close()
 
     # --- Module operations ---
 
