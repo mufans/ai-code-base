@@ -13,6 +13,7 @@ import tree_sitter_java as tsjava
 import tree_sitter_kotlin as tskotlin
 import tree_sitter_swift as tsswift
 import tree_sitter_typescript as tstypescript
+import tree_sitter_arkts as tsarkts
 
 from codekb.storage.sqlite_store import (
     SqliteStore,
@@ -1246,6 +1247,273 @@ class TypeScriptStrategy:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
 
+# --- ArkTS Strategy ---
+
+class ArkTSStrategy:
+    """Strategy for ArkTS (.ets) files using tree-sitter-arkts grammar."""
+
+    def language(self) -> ts.Language:
+        return ts.Language(tsarkts.language())
+
+    def file_extensions(self) -> set[str]:
+        return {".ets"}
+
+    # -- helpers --
+
+    @staticmethod
+    def _node_name(node: ts.Node, source: bytes) -> str:
+        for child in node.children:
+            if child.type in ("identifier", "type_identifier"):
+                return bytes(child.text).decode("utf-8", errors="replace")
+        return ""
+
+    @staticmethod
+    def _child_text(node: ts.Node, child_type: str, source: bytes) -> str:
+        for child in node.children:
+            if child.type == child_type:
+                return bytes(child.text).decode("utf-8", errors="replace")
+        return ""
+
+    @staticmethod
+    def _has_decorator(node: ts.Node, name: str) -> bool:
+        """Check if node has a decorator with the given name (e.g. 'Component', 'Builder')."""
+        for child in node.children:
+            if child.type == "decorator":
+                # decorator -> @ + identifier  OR  @ + call_expression
+                for dc in child.children:
+                    if dc.type == "identifier" and bytes(dc.text).decode() == name:
+                        return True
+                    if dc.type == "call_expression":
+                        for ce in dc.children:
+                            if ce.type == "identifier" and bytes(ce.text).decode() == name:
+                                return True
+        return False
+
+    # -- symbol extraction --
+
+    def extract_symbols(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str, language_name: str
+    ) -> list[Symbol]:
+        symbols: list[Symbol] = []
+        self._walk_for_symbols(tree.root_node, source, file_path, repo_name, language_name, "", symbols)
+        return symbols
+
+    def _walk_for_symbols(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, language_name: str, parent: str, symbols: list[Symbol]
+    ):
+        if node.type == "struct_declaration":
+            name = self._node_name(node, source)
+            kind = "component" if self._has_decorator(node, "Component") else "struct"
+            sig = f"@Component struct {name}" if kind == "component" else f"struct {name}"
+            symbols.append(Symbol(
+                repo_name=repo_name, file_path=file_path, name=name,
+                kind=kind, signature=sig,
+                start_line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+                parent=parent, language=language_name,
+                source=bytes(node.text).decode("utf-8", errors="replace"),
+            ))
+            # Walk struct body for members
+            body = None
+            for child in node.children:
+                if child.type == "struct_body":
+                    body = child
+                    break
+            if body:
+                for child in body.children:
+                    if child.type == "method_definition":
+                        mname = self._child_text(child, "property_identifier", source)
+                        mparams = self._child_text(child, "formal_parameters", source)
+                        symbols.append(Symbol(
+                            repo_name=repo_name, file_path=file_path, name=mname,
+                            kind="method", signature=f"{mname}{mparams}",
+                            start_line=child.start_point[0] + 1, end_line=child.end_point[0] + 1,
+                            parent=name, language=language_name,
+                            source=bytes(child.text).decode("utf-8", errors="replace"),
+                        ))
+                    elif child.type == "public_field_definition":
+                        pname = self._child_text(child, "property_identifier", source)
+                        if pname:
+                            symbols.append(Symbol(
+                                repo_name=repo_name, file_path=file_path, name=pname,
+                                kind="property", signature=pname,
+                                start_line=child.start_point[0] + 1, end_line=child.end_point[0] + 1,
+                                parent=name, language=language_name,
+                                source=bytes(child.text).decode("utf-8", errors="replace"),
+                            ))
+
+        elif node.type == "class_declaration":
+            name = self._node_name(node, source)
+            sig = f"class {name}"
+            symbols.append(Symbol(
+                repo_name=repo_name, file_path=file_path, name=name,
+                kind="class", signature=sig,
+                start_line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+                parent=parent, language=language_name,
+                source=bytes(node.text).decode("utf-8", errors="replace"),
+            ))
+            body = node.child_by_field_name("body")
+            if body:
+                for child in body.children:
+                    if child.type == "method_definition":
+                        mname = self._child_text(child, "property_identifier", source)
+                        mparams = self._child_text(child, "formal_parameters", source)
+                        symbols.append(Symbol(
+                            repo_name=repo_name, file_path=file_path, name=mname,
+                            kind="method", signature=f"{mname}{mparams}",
+                            start_line=child.start_point[0] + 1, end_line=child.end_point[0] + 1,
+                            parent=name, language=language_name,
+                            source=bytes(child.text).decode("utf-8", errors="replace"),
+                        ))
+                    elif child.type == "public_field_definition":
+                        pname = self._child_text(child, "property_identifier", source)
+                        if pname:
+                            symbols.append(Symbol(
+                                repo_name=repo_name, file_path=file_path, name=pname,
+                                kind="property", signature=pname,
+                                start_line=child.start_point[0] + 1, end_line=child.end_point[0] + 1,
+                                parent=name, language=language_name,
+                                source=bytes(child.text).decode("utf-8", errors="replace"),
+                            ))
+
+        elif node.type == "function_declaration":
+            name = self._node_name(node, source)
+            params = self._child_text(node, "formal_parameters", source)
+            is_builder = self._has_decorator(node, "Builder")
+            is_extend = self._has_decorator(node, "Extend")
+            if is_builder:
+                kind = "builder"
+                sig = f"@Builder function {name}{params}"
+            elif is_extend:
+                kind = "extend"
+                sig = f"@Extend function {name}{params}"
+            else:
+                kind = "function"
+                sig = f"function {name}{params}"
+            symbols.append(Symbol(
+                repo_name=repo_name, file_path=file_path, name=name,
+                kind=kind, signature=sig,
+                start_line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+                parent=parent, language=language_name,
+                source=bytes(node.text).decode("utf-8", errors="replace"),
+            ))
+
+        elif node.type == "interface_declaration":
+            name = self._node_name(node, source)
+            sig = f"interface {name}"
+            symbols.append(Symbol(
+                repo_name=repo_name, file_path=file_path, name=name,
+                kind="interface", signature=sig,
+                start_line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+                parent=parent, language=language_name,
+                source=bytes(node.text).decode("utf-8", errors="replace"),
+            ))
+
+        elif node.type == "enum_declaration":
+            name = self._node_name(node, source)
+            sig = f"enum {name}"
+            symbols.append(Symbol(
+                repo_name=repo_name, file_path=file_path, name=name,
+                kind="enum", signature=sig,
+                start_line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+                parent=parent, language=language_name,
+                source=bytes(node.text).decode("utf-8", errors="replace"),
+            ))
+
+        elif node.type == "type_alias_declaration":
+            name = self._node_name(node, source)
+            sig = f"type {name}"
+            symbols.append(Symbol(
+                repo_name=repo_name, file_path=file_path, name=name,
+                kind="type", signature=sig,
+                start_line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+                parent=parent, language=language_name,
+                source=bytes(node.text).decode("utf-8", errors="replace"),
+            ))
+
+        else:
+            for child in node.children:
+                self._walk_for_symbols(child, source, file_path, repo_name, language_name, parent, symbols)
+
+    # -- call extraction (reuse TS pattern) --
+
+    def extract_calls(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[CallRelation]:
+        calls: list[CallRelation] = []
+        self._walk_for_calls(tree.root_node, source, file_path, repo_name, "<module>", calls)
+        return calls
+
+    def _walk_for_calls(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, caller_name: str, calls: list[CallRelation]
+    ):
+        if node.type == "struct_declaration":
+            name = self._node_name(node, source)
+            self._collect_calls_in_node(node, name, file_path, repo_name, calls)
+            return
+        elif node.type == "function_declaration":
+            name = self._node_name(node, source)
+            self._collect_calls_in_node(node, name, file_path, repo_name, calls)
+            return
+        elif node.type == "method_definition":
+            name = self._child_text(node, "property_identifier", source)
+            self._collect_calls_in_node(node, name, file_path, repo_name, calls)
+            return
+        elif node.type == "class_declaration":
+            name = self._node_name(node, source)
+            self._collect_calls_in_node(node, name, file_path, repo_name, calls)
+            return
+        for child in node.children:
+            self._walk_for_calls(child, source, file_path, repo_name, caller_name, calls)
+
+    def _collect_calls_in_node(
+        self, node: ts.Node, caller_name: str, file_path: str,
+        repo_name: str, calls: list[CallRelation]
+    ):
+        if node.type == "call_expression":
+            func = node.child_by_field_name("function")
+            if func:
+                callee = bytes(func.text).decode("utf-8", errors="replace")
+                calls.append(CallRelation(
+                    repo_name=repo_name, caller_file=file_path,
+                    caller_name=caller_name, callee_name=callee,
+                    line_number=node.start_point[0] + 1,
+                ))
+        for child in node.children:
+            self._collect_calls_in_node(child, caller_name, file_path, repo_name, calls)
+
+    # -- import extraction (reuse TS pattern) --
+
+    def extract_imports(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[ImportRecord]:
+        imports: list[ImportRecord] = []
+        self._walk_for_imports(tree.root_node, source, file_path, repo_name, imports)
+        return imports
+
+    def _walk_for_imports(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, imports: list[ImportRecord]
+    ):
+        if node.type == "import_statement":
+            module = ""
+            imported_names = ""
+            for child in node.children:
+                if child.type == "string":
+                    module = bytes(child.text).decode("utf-8", errors="replace").strip("'\"")
+                elif child.type == "import_clause":
+                    imported_names = bytes(child.text).decode("utf-8", errors="replace")
+            imports.append(ImportRecord(
+                repo_name=repo_name, file_path=file_path,
+                module=module, imported_names=imported_names,
+                line_number=node.start_point[0] + 1,
+            ))
+        else:
+            for child in node.children:
+                self._walk_for_imports(child, source, file_path, repo_name, imports)
+
+
 # --- Indexer ---
 
 EXTENSION_TO_LANGUAGE: dict[str, str] = {
@@ -1260,6 +1528,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".swift": "swift",
     ".ts": "typescript",
     ".tsx": "tsx",
+    ".ets": "arkts",
 }
 
 ENTRY_POINT_NAMES = {"main", "app", "index", "__main__", "server", "wsgi"}
@@ -1278,6 +1547,7 @@ class TreeSitterIndexer:
             "swift": SwiftStrategy(),
             "typescript": TypeScriptStrategy(),
             "tsx": TypeScriptStrategy(is_tsx=True),
+            "arkts": ArkTSStrategy(),
         }
         self._parsers: dict[str, ts.Parser] = {}
         for lang_name, strategy in self._strategies.items():
@@ -1317,8 +1587,9 @@ class TreeSitterIndexer:
         """
         stats = {"files_indexed": 0, "symbols_found": 0, "calls_found": 0, "imports_found": 0}
 
-        # Clear existing structure data
+        # Clear existing structure data and guide cache
         self.store.clear_repo_structure(repo_name)
+        self.store.clear_guide_cache(repo_name)
 
         all_symbols: list[Symbol] = []
         all_calls: list[CallRelation] = []
