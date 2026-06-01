@@ -44,6 +44,7 @@ class Symbol(BaseModel):
     parent: str = ""
     language: str = ""
     source: str = ""  # the actual source code of the symbol
+    repo_module: str = ""
 
 
 class CallRelation(BaseModel):
@@ -55,6 +56,7 @@ class CallRelation(BaseModel):
     callee_name: str
     callee_file: str = ""
     line_number: int = 0
+    repo_module: str = ""
 
 
 class ImportRecord(BaseModel):
@@ -66,6 +68,7 @@ class ImportRecord(BaseModel):
     imported_names: str = ""  # JSON list
     line_number: int = 0
     is_relative: bool = False
+    repo_module: str = ""
 
 
 class FileEntry(BaseModel):
@@ -77,6 +80,7 @@ class FileEntry(BaseModel):
     is_entry_point: bool = False
     symbol_count: int = 0
     last_modified: str = ""
+    repo_module: str = ""
 
 
 # --- SQLite Store ---
@@ -116,7 +120,8 @@ class SqliteStore:
                 added_at TEXT DEFAULT '',
                 last_indexed_at TEXT DEFAULT '',
                 file_count INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'registered'
+                status TEXT DEFAULT 'registered',
+                modules_json TEXT DEFAULT '[]'
             );
 
             CREATE TABLE IF NOT EXISTS index_status (
@@ -134,6 +139,9 @@ class SqliteStore:
         conn.commit()
         conn.close()
 
+        # Ensure doc_index table exists (idempotent migration)
+        self._ensure_doc_index_table()
+
         # structure.db
         conn = self._connect(self._struct_path)
         conn.executescript("""
@@ -149,7 +157,8 @@ class SqliteStore:
                 end_line INTEGER DEFAULT 0,
                 parent TEXT DEFAULT '',
                 language TEXT DEFAULT '',
-                source TEXT DEFAULT ''
+                source TEXT DEFAULT '',
+                repo_module TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS calls (
@@ -159,7 +168,8 @@ class SqliteStore:
                 caller_name TEXT NOT NULL,
                 callee_name TEXT NOT NULL,
                 callee_file TEXT DEFAULT '',
-                line_number INTEGER DEFAULT 0
+                line_number INTEGER DEFAULT 0,
+                repo_module TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS imports (
@@ -169,7 +179,8 @@ class SqliteStore:
                 module TEXT NOT NULL,
                 imported_names TEXT DEFAULT '',
                 line_number INTEGER DEFAULT 0,
-                is_relative INTEGER DEFAULT 0
+                is_relative INTEGER DEFAULT 0,
+                repo_module TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS file_tree (
@@ -179,17 +190,25 @@ class SqliteStore:
                 language TEXT DEFAULT '',
                 is_entry_point INTEGER DEFAULT 0,
                 symbol_count INTEGER DEFAULT 0,
-                last_modified TEXT DEFAULT ''
+                last_modified TEXT DEFAULT '',
+                repo_module TEXT NOT NULL DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS idx_symbols_repo_file ON symbols(repo_name, file_path);
             CREATE INDEX IF NOT EXISTS idx_symbols_repo_name ON symbols(repo_name, name);
+            CREATE INDEX IF NOT EXISTS idx_symbols_repo_module ON symbols(repo_name, repo_module);
             CREATE INDEX IF NOT EXISTS idx_calls_repo ON calls(repo_name);
+            CREATE INDEX IF NOT EXISTS idx_calls_repo_module ON calls(repo_name, repo_module);
             CREATE INDEX IF NOT EXISTS idx_imports_repo ON imports(repo_name);
+            CREATE INDEX IF NOT EXISTS idx_imports_repo_module ON imports(repo_name, repo_module);
             CREATE INDEX IF NOT EXISTS idx_file_tree_repo ON file_tree(repo_name);
+            CREATE INDEX IF NOT EXISTS idx_file_tree_repo_module ON file_tree(repo_name, repo_module);
         """)
         conn.commit()
         conn.close()
+
+        # Migrate existing databases
+        self._migrate_add_repo_module()
 
     # --- Repo operations ---
 
@@ -265,35 +284,43 @@ class SqliteStore:
         conn = self._connect(self._struct_path)
         conn.executemany(
             """INSERT INTO symbols (repo_name, file_path, name, kind, signature, docstring,
-               start_line, end_line, parent, language, source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               start_line, end_line, parent, language, source, repo_module)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [(s.repo_name, s.file_path, s.name, s.kind, s.signature, s.docstring,
-              s.start_line, s.end_line, s.parent, s.language, s.source) for s in symbols],
+              s.start_line, s.end_line, s.parent, s.language, s.source, s.repo_module) for s in symbols],
         )
         conn.commit()
         conn.close()
 
-    def get_symbols(self, repo_name: str, file_path: Optional[str] = None) -> list[Symbol]:
+    def get_symbols(self, repo_name: str, file_path: Optional[str] = None,
+                    repo_module: Optional[str] = None) -> list[Symbol]:
         conn = self._connect(self._struct_path)
+        query = "SELECT * FROM symbols WHERE repo_name = ?"
+        params: list = [repo_name]
+
         if file_path:
-            rows = conn.execute(
-                "SELECT * FROM symbols WHERE repo_name = ? AND file_path = ? ORDER BY start_line",
-                (repo_name, file_path),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM symbols WHERE repo_name = ? ORDER BY file_path, start_line",
-                (repo_name,),
-            ).fetchall()
+            query += " AND file_path = ?"
+            params.append(file_path)
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        query += " ORDER BY file_path, start_line"
+        rows = conn.execute(query, params).fetchall()
         conn.close()
         return [Symbol(**dict(r)) for r in rows]
 
-    def get_symbol_by_name(self, repo_name: str, name: str) -> list[Symbol]:
+    def get_symbol_by_name(self, repo_name: str, name: str,
+                           repo_module: Optional[str] = None) -> list[Symbol]:
         conn = self._connect(self._struct_path)
-        rows = conn.execute(
-            "SELECT * FROM symbols WHERE repo_name = ? AND name = ?",
-            (repo_name, name),
-        ).fetchall()
+        query = "SELECT * FROM symbols WHERE repo_name = ? AND name = ?"
+        params: list = [repo_name, name]
+
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        rows = conn.execute(query, params).fetchall()
         conn.close()
         return [Symbol(**dict(r)) for r in rows]
 
@@ -313,28 +340,38 @@ class SqliteStore:
             return
         conn = self._connect(self._struct_path)
         conn.executemany(
-            """INSERT INTO calls (repo_name, caller_file, caller_name, callee_name, callee_file, line_number)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [(c.repo_name, c.caller_file, c.caller_name, c.callee_name, c.callee_file, c.line_number) for c in calls],
+            """INSERT INTO calls (repo_name, caller_file, caller_name, callee_name, callee_file, line_number, repo_module)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [(c.repo_name, c.caller_file, c.caller_name, c.callee_name, c.callee_file, c.line_number, c.repo_module) for c in calls],
         )
         conn.commit()
         conn.close()
 
-    def get_calls_from(self, repo_name: str, caller_name: str) -> list[CallRelation]:
+    def get_calls_from(self, repo_name: str, caller_name: str,
+                       repo_module: Optional[str] = None) -> list[CallRelation]:
         conn = self._connect(self._struct_path)
-        rows = conn.execute(
-            "SELECT * FROM calls WHERE repo_name = ? AND caller_name = ?",
-            (repo_name, caller_name),
-        ).fetchall()
+        query = "SELECT * FROM calls WHERE repo_name = ? AND caller_name = ?"
+        params: list = [repo_name, caller_name]
+
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        rows = conn.execute(query, params).fetchall()
         conn.close()
         return [CallRelation(**dict(r)) for r in rows]
 
-    def get_calls_to(self, repo_name: str, callee_name: str) -> list[CallRelation]:
+    def get_calls_to(self, repo_name: str, callee_name: str,
+                     repo_module: Optional[str] = None) -> list[CallRelation]:
         conn = self._connect(self._struct_path)
-        rows = conn.execute(
-            "SELECT * FROM calls WHERE repo_name = ? AND callee_name = ?",
-            (repo_name, callee_name),
-        ).fetchall()
+        query = "SELECT * FROM calls WHERE repo_name = ? AND callee_name = ?"
+        params: list = [repo_name, callee_name]
+
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        rows = conn.execute(query, params).fetchall()
         conn.close()
         return [CallRelation(**dict(r)) for r in rows]
 
@@ -354,25 +391,28 @@ class SqliteStore:
             return
         conn = self._connect(self._struct_path)
         conn.executemany(
-            """INSERT INTO imports (repo_name, file_path, module, imported_names, line_number, is_relative)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [(i.repo_name, i.file_path, i.module, i.imported_names, i.line_number, int(i.is_relative)) for i in imports],
+            """INSERT INTO imports (repo_name, file_path, module, imported_names, line_number, is_relative, repo_module)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [(i.repo_name, i.file_path, i.module, i.imported_names, i.line_number, int(i.is_relative), i.repo_module) for i in imports],
         )
         conn.commit()
         conn.close()
 
-    def get_imports(self, repo_name: str, file_path: Optional[str] = None) -> list[ImportRecord]:
+    def get_imports(self, repo_name: str, file_path: Optional[str] = None,
+                    repo_module: Optional[str] = None) -> list[ImportRecord]:
         conn = self._connect(self._struct_path)
+        query = "SELECT * FROM imports WHERE repo_name = ?"
+        params: list = [repo_name]
+
         if file_path:
-            rows = conn.execute(
-                "SELECT * FROM imports WHERE repo_name = ? AND file_path = ? ORDER BY line_number",
-                (repo_name, file_path),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM imports WHERE repo_name = ? ORDER BY file_path, line_number",
-                (repo_name,),
-            ).fetchall()
+            query += " AND file_path = ?"
+            params.append(file_path)
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        query += " ORDER BY file_path, line_number"
+        rows = conn.execute(query, params).fetchall()
         conn.close()
         return [ImportRecord(**dict(r)) for r in rows]
 
@@ -395,27 +435,32 @@ class SqliteStore:
         ).fetchone()
         if existing:
             conn.execute(
-                """UPDATE file_tree SET language=?, is_entry_point=?, symbol_count=?, last_modified=?
+                """UPDATE file_tree SET language=?, is_entry_point=?, symbol_count=?, last_modified=?, repo_module=?
                    WHERE repo_name=? AND path=?""",
                 (entry.language, int(entry.is_entry_point), entry.symbol_count, entry.last_modified,
-                 entry.repo_name, entry.path),
+                 entry.repo_module, entry.repo_name, entry.path),
             )
         else:
             conn.execute(
-                """INSERT INTO file_tree (repo_name, path, language, is_entry_point, symbol_count, last_modified)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO file_tree (repo_name, path, language, is_entry_point, symbol_count, last_modified, repo_module)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (entry.repo_name, entry.path, entry.language, int(entry.is_entry_point),
-                 entry.symbol_count, entry.last_modified),
+                 entry.symbol_count, entry.last_modified, entry.repo_module),
             )
         conn.commit()
         conn.close()
 
-    def get_file_tree(self, repo_name: str) -> list[FileEntry]:
+    def get_file_tree(self, repo_name: str, repo_module: Optional[str] = None) -> list[FileEntry]:
         conn = self._connect(self._struct_path)
-        rows = conn.execute(
-            "SELECT * FROM file_tree WHERE repo_name = ? ORDER BY path",
-            (repo_name,),
-        ).fetchall()
+        query = "SELECT * FROM file_tree WHERE repo_name = ?"
+        params: list = [repo_name]
+
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        query += " ORDER BY path"
+        rows = conn.execute(query, params).fetchall()
         conn.close()
         return [FileEntry(**{**dict(r), "is_entry_point": bool(r["is_entry_point"])}) for r in rows]
 
@@ -432,3 +477,184 @@ class SqliteStore:
             conn.execute(f"DELETE FROM {table} WHERE repo_name = ?", (repo_name,))
         conn.commit()
         conn.close()
+
+    # --- Doc index operations ---
+
+    def _ensure_doc_index_table(self):
+        """Create doc_index table if it doesn't exist (idempotent)."""
+        conn = self._connect(self._struct_path)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS doc_index (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                full_path TEXT NOT NULL,
+                doc_type TEXT NOT NULL DEFAULT 'other',
+                title TEXT DEFAULT '',
+                size_bytes INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT '',
+                UNIQUE(repo_name, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_doc_index_repo ON doc_index(repo_name);
+            CREATE INDEX IF NOT EXISTS idx_doc_index_type ON doc_index(repo_name, doc_type);
+        """)
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _detect_doc_type(file_path: str) -> str:
+        """Auto-detect doc type from file path."""
+        name = file_path.upper()
+        basename = Path(file_path).name.upper()
+        if basename in ("README.MD", "README.RST", "README.TXT", "README"):
+            return "readme"
+        if basename == "CLAUDE.MD":
+            return "claude_md"
+        if basename == "SKILL.MD":
+            return "skill"
+        if basename == "ARCHITECTURE.MD":
+            return "architecture"
+        parts = Path(file_path).parts
+        if parts and parts[0].lower() == "docs":
+            return "docs"
+        return "other"
+
+    @staticmethod
+    def _extract_title(file_path: Path) -> str:
+        """Extract title from first # heading in a markdown file."""
+        try:
+            with open(file_path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#"):
+                        return line.lstrip("#").strip()
+                    if line:
+                        break
+        except (OSError, IOError):
+            pass
+        return ""
+
+    def index_docs(self, repo_name: str, repo_path: Path) -> int:
+        """Scan and index md documents in a repo. Returns count of indexed docs."""
+        conn = self._connect(self._struct_path)
+
+        # Delete existing entries for this repo
+        conn.execute("DELETE FROM doc_index WHERE repo_name = ?", (repo_name,))
+
+        md_files: list[tuple[str, str, str, int, str]] = []
+
+        # 1. Root-level md files
+        for item in repo_path.iterdir():
+            if item.is_file() and item.suffix.lower() == ".md":
+                rel_path = item.name
+                full_path = str(item)
+                doc_type = self._detect_doc_type(rel_path)
+                title = self._extract_title(item)
+                size = item.stat().st_size
+                md_files.append((rel_path, full_path, doc_type, size, title))
+
+        # 2. docs/ directory recursive scan
+        docs_dir = repo_path / "docs"
+        if docs_dir.is_dir():
+            for md_file in docs_dir.rglob("*.md"):
+                rel_path = str(md_file.relative_to(repo_path))
+                full_path = str(md_file)
+                doc_type = self._detect_doc_type(rel_path)
+                title = self._extract_title(md_file)
+                size = md_file.stat().st_size
+                md_files.append((rel_path, full_path, doc_type, size, title))
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.executemany(
+            """INSERT OR REPLACE INTO doc_index
+               (repo_name, file_path, full_path, doc_type, title, size_bytes, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [(repo_name, rel, full, dt, title, sz, now) for rel, full, dt, sz, title in md_files],
+        )
+        conn.commit()
+        conn.close()
+        return len(md_files)
+
+    def get_doc_index(self, repo_name: str, doc_type: str | None = None) -> list[dict]:
+        """Get doc index list for a repo, optionally filtered by type."""
+        conn = self._connect(self._struct_path)
+        if doc_type:
+            rows = conn.execute(
+                "SELECT * FROM doc_index WHERE repo_name = ? AND doc_type = ? ORDER BY file_path",
+                (repo_name, doc_type),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM doc_index WHERE repo_name = ? ORDER BY file_path",
+                (repo_name,),
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def get_doc_index_by_path(self, repo_name: str, file_path: str) -> dict | None:
+        """Get a single doc index entry by repo and file path."""
+        conn = self._connect(self._struct_path)
+        row = conn.execute(
+            "SELECT * FROM doc_index WHERE repo_name = ? AND file_path = ?",
+            (repo_name, file_path),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    # --- Migration ---
+
+    def _migrate_add_repo_module(self):
+        """Add repo_module column to existing tables (idempotent)."""
+        for db_path in [self._meta_path, self._struct_path]:
+            conn = self._connect(db_path)
+            if db_path == self._meta_path:
+                # Add modules_json to repos table
+                try:
+                    conn.execute("ALTER TABLE repos ADD COLUMN modules_json TEXT DEFAULT '[]'")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+            else:
+                for table in ["symbols", "calls", "imports", "file_tree"]:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN repo_module TEXT NOT NULL DEFAULT ''")
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+            conn.commit()
+            conn.close()
+
+    # --- Module operations ---
+
+    def list_modules(self, repo_name: str) -> list[str]:
+        """List unique module names for a repo."""
+        conn = self._connect(self._struct_path)
+        rows = conn.execute(
+            "SELECT DISTINCT repo_module FROM symbols WHERE repo_name = ? ORDER BY repo_module",
+            (repo_name,),
+        ).fetchall()
+        conn.close()
+        return [r["repo_module"] for r in rows if r["repo_module"]]
+
+    def save_repo_modules(self, repo_name: str, modules: list[dict]):
+        """Save detected module info as JSON on the repos table."""
+        conn = self._connect(self._meta_path)
+        conn.execute(
+            "UPDATE repos SET modules_json = ? WHERE name = ?",
+            (json.dumps(modules, ensure_ascii=False), repo_name),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_repo_modules(self, repo_name: str) -> list[dict]:
+        """Get saved module info for a repo."""
+        conn = self._connect(self._meta_path)
+        row = conn.execute(
+            "SELECT modules_json FROM repos WHERE name = ?",
+            (repo_name,),
+        ).fetchone()
+        conn.close()
+        if row is None or not row["modules_json"]:
+            return []
+        try:
+            return json.loads(row["modules_json"])
+        except (json.JSONDecodeError, TypeError):
+            return []

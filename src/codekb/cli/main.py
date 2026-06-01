@@ -93,6 +93,7 @@ def serve(
 def sync(
     repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Sync specific repo"),
     full: bool = typer.Option(False, "--full", help="Force full re-index"),
+    module: Optional[str] = typer.Option(None, "--module", "-m", help="Filter to specific module"),
 ):
     """Sync indexes (incremental by default)."""
     config, store, vector_store, doc_store, repo_manager = _get_services()
@@ -220,19 +221,63 @@ def repo_info(name: str):
     console.print(f"  Added: {repo.added_at}")
     console.print(f"  Last indexed: {repo.last_indexed_at}")
 
+    # Show modules
+    modules_data = store.get_repo_modules(name)
+    if modules_data:
+        console.print(f"\n  [bold]Modules ({len(modules_data)}):[/bold]")
+        for mod in modules_data:
+            mod_lang = f" ({mod['language']})" if mod.get("language") else ""
+            console.print(f"    {mod['name']}: {mod.get('path', '')}{mod_lang}")
+
     # Show file tree summary
     files = store.get_file_tree(name)
     if files:
         console.print(f"\n  [bold]Indexed files ({len(files)}):[/bold]")
         for f in files[:20]:
             entry_marker = " [dim](entry point)[/dim]" if f.is_entry_point else ""
-            console.print(f"    {f.path} ({f.language}, {f.symbol_count} symbols){entry_marker}")
+            module_marker = f" [{f.repo_module}]" if f.repo_module else ""
+            console.print(f"    {f.path} ({f.language}, {f.symbol_count} symbols){module_marker}{entry_marker}")
         if len(files) > 20:
             console.print(f"    ... and {len(files) - 20} more")
 
 
+@repo_app.command("modules")
+def repo_modules(name: str):
+    """List modules in a repository."""
+    config, store, vector_store, doc_store, repo_manager = _get_services()
+
+    repo = store.get_repo(name)
+    if repo is None:
+        error_console.print(f"[red]Repo not found: {name}[/red]")
+        raise typer.Exit(code=1)
+
+    modules_data = store.get_repo_modules(name)
+    if not modules_data:
+        console.print("No modules detected (single-module repository).")
+        return
+
+    table = Table(title=f"Modules for {name}")
+    table.add_column("Name", style="bold")
+    table.add_column("Path")
+    table.add_column("Language")
+    table.add_column("Source")
+
+    for mod in modules_data:
+        table.add_row(
+            mod["name"],
+            mod.get("path", ""),
+            mod.get("language", ""),
+            mod.get("source", "auto"),
+        )
+
+    console.print(table)
+
+
 @docs_app.command("generate")
-def docs_generate(name: str):
+def docs_generate(
+    name: str,
+    module: str = typer.Option("", "--module", "-m", help="Generate docs for specific module"),
+):
     """Generate architecture docs for a repository."""
     from codekb.indexers.doc_generator import DocGenerator
 
@@ -245,7 +290,7 @@ def docs_generate(name: str):
         console.print(f"Generating docs for [bold]{name}[/bold]...")
         if llm_client:
             console.print(f"  Using LLM: [bold]{llm_client['model']}[/bold]")
-        result = await generator.generate_docs(name, llm_client=llm_client)
+        result = await generator.generate_docs(name, llm_client=llm_client, repo_module=module)
         console.print(f"[green]Done[/green]: {result}")
 
     asyncio.run(_generate())
@@ -312,7 +357,10 @@ def skills_review(
 
 
 @skills_app.command("generate")
-def skills_generate(name: str):
+def skills_generate(
+    name: str,
+    module: str = typer.Option("", "--module", "-m", help="Generate skills for specific module"),
+):
     """Generate skills for a repository."""
     from codekb.indexers.skill_generator import SkillGenerator
 
@@ -325,7 +373,7 @@ def skills_generate(name: str):
         console.print(f"Generating skills for [bold]{name}[/bold]...")
         if llm_client:
             console.print(f"  Using LLM: [bold]{llm_client['model']}[/bold]")
-        result = await sg.generate_skills(name, llm_client=llm_client)
+        result = await sg.generate_skills(name, llm_client=llm_client, repo_module=module)
         if not result:
             console.print("No skills generated.")
             return

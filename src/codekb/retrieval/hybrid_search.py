@@ -58,14 +58,17 @@ class HybridSearch:
         self,
         query: str,
         repo_name: Optional[str] = None,
+        repo_module: Optional[str] = None,
         top_k: int = 10,
         code_weight: float = 0.7,
         doc_weight: float = 0.3,
     ) -> list[SearchResult]:
         """Hybrid search: vector + keyword, fused with RRF."""
         # Vector search
-        code_results = await self.semantic.search_code(query, repo_name=repo_name, top_k=top_k * 3)
-        doc_results = await self.semantic.search_docs(query, repo_name=repo_name, top_k=top_k * 3)
+        code_results = await self.semantic.search_code(query, repo_name=repo_name,
+                                                        repo_module=repo_module, top_k=top_k * 3)
+        doc_results = await self.semantic.search_docs(query, repo_name=repo_name,
+                                                       repo_module=repo_module, top_k=top_k * 3)
 
         # Keyword search
         code_keyword = _keyword_search(query, code_results, top_k=top_k * 3)

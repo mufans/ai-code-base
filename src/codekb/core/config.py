@@ -62,6 +62,14 @@ class IndexConfig(BaseModel):
     )
 
 
+class ModuleConfig(BaseModel):
+    """Configuration for a module within a multi-module repository."""
+
+    name: str
+    path: str = ""
+    language: str = ""
+
+
 class CodekbYamlConfig(BaseModel):
     """Top-level codekb.yaml configuration."""
 
@@ -79,6 +87,7 @@ class CodekbYamlConfig(BaseModel):
     assignments: AssignmentsConfig = Field(default_factory=AssignmentsConfig)
     webhook: WebhookConfig = Field(default_factory=WebhookConfig)
     index: IndexConfig = Field(default_factory=IndexConfig)
+    repo_modules: dict[str, list[ModuleConfig]] = Field(default_factory=dict)
 
 
 class Settings(BaseSettings):

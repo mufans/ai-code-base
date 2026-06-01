@@ -20,7 +20,8 @@ class SkillGenerator:
         self.doc_store = doc_store
         self.config = config
 
-    async def generate_skills(self, repo_name: str, llm_client=None) -> list[dict]:
+    async def generate_skills(self, repo_name: str, llm_client=None,
+                              repo_module: str = "") -> list[dict]:
         """Generate skills for a repo based on structure + docs.
 
         Skills are task-level actionable prompts like:
@@ -28,7 +29,7 @@ class SkillGenerator:
         - create-api-endpoint
         - add-database-migration
         """
-        symbols = self.store.get_symbols(repo_name)
+        symbols = self.store.get_symbols(repo_name, repo_module=repo_module or None)
         calls = self.store.get_calls_from(repo_name, "")
         imports = self.store.get_imports(repo_name)
 
@@ -55,7 +56,8 @@ class SkillGenerator:
                 # Add YAML frontmatter (prepend to body, preserving body content)
                 frontmatter = self._add_skill_frontmatter(candidate, verification)
                 skill_content = frontmatter + skill_content
-                self.doc_store.write_skill(repo_name, candidate["name"], skill_content)
+                self.doc_store.write_skill(repo_name, candidate["name"], skill_content,
+                                           repo_module=repo_module)
 
                 generated.append({
                     "name": candidate["name"],

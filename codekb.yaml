@@ -1,0 +1,32 @@
+codekb:
+  data_dir: ~/.codekb
+
+  llm_providers:
+    deepseek:
+      provider: openai
+      base_url: https://api.deepseek.com
+      model: deepseek/deepseek-chat
+
+  embedding_providers:
+    local:
+      provider: sentence-transformers
+      model: all-MiniLM-L6-v2
+      dimension: 384
+
+  assignments:
+    doc_generation: deepseek
+    code_embedding: local
+    doc_embedding: local
+
+  index:
+    chunk_size: 512
+    chunk_overlap: 64
+    max_file_size: 1048576
+    exclude_patterns:
+      - "*.min.js"
+      - "*.lock"
+      - "node_modules/**"
+      - "__pycache__/**"
+      - ".git/**"
+      - "dist/**"
+      - "build/**"

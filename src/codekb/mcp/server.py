@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Optional
 
 import mcp.types as types
@@ -66,6 +67,24 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 },
             ),
             types.Tool(
+                name="list_modules",
+                description="List all modules in a repository (for monorepo/multi-package support)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"repo_name": {"type": "string"}},
+                    "required": ["repo_name"],
+                },
+            ),
+            types.Tool(
+                name="get_module_dependencies",
+                description="Get cross-module dependency relationships in a repository",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"repo_name": {"type": "string"}},
+                    "required": ["repo_name"],
+                },
+            ),
+            types.Tool(
                 name="search_code",
                 description="Semantic code search across repositories",
                 inputSchema={
@@ -73,6 +92,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                     "properties": {
                         "query": {"type": "string", "description": "Search query"},
                         "repo_name": {"type": "string", "description": "Optional repo filter"},
+                        "module": {"type": "string", "description": "Optional module filter"},
                         "top_k": {"type": "integer", "description": "Max results", "default": 10},
                     },
                     "required": ["query"],
@@ -86,6 +106,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                     "properties": {
                         "repo_name": {"type": "string"},
                         "path": {"type": "string", "description": "Optional file path filter"},
+                        "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name"],
                 },
@@ -98,6 +119,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                     "properties": {
                         "repo_name": {"type": "string"},
                         "symbol_name": {"type": "string"},
+                        "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name", "symbol_name"],
                 },
@@ -130,7 +152,10 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 description="Get generated architecture document for a repository",
                 inputSchema={
                     "type": "object",
-                    "properties": {"repo_name": {"type": "string"}},
+                    "properties": {
+                        "repo_name": {"type": "string"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                    },
                     "required": ["repo_name"],
                 },
             ),
@@ -143,6 +168,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                         "repo_name": {"type": "string"},
                         "library_or_pattern": {"type": "string"},
                         "top_k": {"type": "integer", "default": 5},
+                        "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name", "library_or_pattern"],
                 },
@@ -155,6 +181,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                     "properties": {
                         "repo_name": {"type": "string"},
                         "library": {"type": "string"},
+                        "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name", "library"],
                 },
@@ -170,6 +197,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                             "type": "string",
                             "description": "controller, service, repository, config, test, model, etc.",
                         },
+                        "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name", "pattern_type"],
                 },
@@ -179,7 +207,10 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 description="List available skills for a repository",
                 inputSchema={
                     "type": "object",
-                    "properties": {"repo_name": {"type": "string"}},
+                    "properties": {
+                        "repo_name": {"type": "string"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                    },
                     "required": ["repo_name"],
                 },
             ),
@@ -191,8 +222,33 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                     "properties": {
                         "repo_name": {"type": "string"},
                         "skill_name": {"type": "string"},
+                        "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name", "skill_name"],
+                },
+            ),
+            types.Tool(
+                name="list_doc_index",
+                description="List document index for a repository (file name, type, size, title). Lightweight metadata only, no content.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "doc_type": {"type": "string", "description": "Optional type filter: readme, claude_md, skill, architecture, docs, other"},
+                    },
+                    "required": ["repo_name"],
+                },
+            ),
+            types.Tool(
+                name="read_doc",
+                description="Read the full content of a markdown document from a repository by file path",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "file_path": {"type": "string", "description": "Relative file path, e.g. CLAUDE.md or docs/architecture.md"},
+                    },
+                    "required": ["repo_name", "file_path"],
                 },
             ),
         ]
@@ -227,6 +283,15 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 name=f"{repo.name} Core Chain",
                 mimeType="text/markdown",
             ))
+            # Add module-level resources
+            modules_data = store.get_repo_modules(repo.name)
+            for mod in modules_data:
+                mod_name = mod["name"]
+                resources.append(types.Resource(
+                    uri=f"codekb://repos/{repo.name}/modules/{mod_name}/architecture",
+                    name=f"{repo.name}/{mod_name} Architecture",
+                    mimeType="text/markdown",
+                ))
         return resources
 
     @server.list_resource_templates()
@@ -258,6 +323,14 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 elif rest == "core-chain":
                     content = doc_store.read_doc(repo_name, "CORE_CHAIN.md")
                     return content or f"No core chain doc generated for {repo_name}"
+                elif rest.startswith("modules/") and "/architecture" in rest:
+                    # Module-level architecture resource
+                    # Format: modules/{module_name}/architecture
+                    mod_rest = rest[len("modules/"):]
+                    mod_name = mod_rest.split("/")[0]
+                    content = doc_store.read_doc(repo_name, "ARCHITECTURE.md",
+                                                  repo_module=mod_name)
+                    return content or f"No architecture doc for module {mod_name}"
                 elif rest.startswith("file/"):
                     file_path = rest[5:]
                     result = structure_query.get_file_content(repo_name, file_path)
@@ -315,17 +388,31 @@ async def _handle_tool(
             "doc_coverage": doc_store.read_coverage(repo.name),
         }
 
+    elif name == "list_modules":
+        modules = structure_query.list_modules(arguments["repo_name"])
+        modules_data = store.get_repo_modules(arguments["repo_name"])
+        return {
+            "modules": modules_data if modules_data else [{"name": m} for m in modules],
+            "is_monorepo": len(modules) > 0,
+        }
+
+    elif name == "get_module_dependencies":
+        return structure_query.get_module_dependencies(arguments["repo_name"])
+
     elif name == "search_code":
         query = arguments["query"]
         repo_name = arguments.get("repo_name")
+        repo_module = arguments.get("module")
         top_k = arguments.get("top_k", 10)
-        results = await hybrid_search.search(query, repo_name=repo_name, top_k=top_k)
+        results = await hybrid_search.search(query, repo_name=repo_name,
+                                              repo_module=repo_module, top_k=top_k)
         return [
             {
                 "file": r.file_path,
                 "line_range": f"{r.metadata.get('start_line', '')}-{r.metadata.get('end_line', '')}",
                 "code": r.content[:500],
                 "score": round(r.score, 4),
+                "module": r.repo_module,
                 "context": {
                     "name": r.metadata.get("name", ""),
                     "kind": r.metadata.get("kind", ""),
@@ -338,12 +425,14 @@ async def _handle_tool(
         return structure_query.get_structure(
             arguments["repo_name"],
             path=arguments.get("path"),
+            repo_module=arguments.get("module"),
         )
 
     elif name == "get_symbol_detail":
         return structure_query.get_symbol_detail(
             arguments["repo_name"],
             arguments["symbol_name"],
+            repo_module=arguments.get("module"),
         ) or {"error": "Symbol not found"}
 
     elif name == "get_file_content":
@@ -360,13 +449,16 @@ async def _handle_tool(
         return {"content": content} if content else {"error": "README not found"}
 
     elif name == "get_architecture":
-        content = doc_store.read_doc(arguments["repo_name"], "ARCHITECTURE.md")
-        coverage = doc_store.read_coverage(arguments["repo_name"])
+        repo_module = arguments.get("module", "")
+        content = doc_store.read_doc(arguments["repo_name"], "ARCHITECTURE.md",
+                                      repo_module=repo_module)
+        coverage = doc_store.read_coverage(arguments["repo_name"], repo_module=repo_module)
         return {
             "architecture_doc": content or "Not yet generated",
             "confidence": coverage,
             "generated_sections": [
-                f for f in doc_store.list_docs(arguments["repo_name"])
+                f for f in doc_store.list_docs(arguments["repo_name"],
+                                                repo_module=arguments.get("module", ""))
                 if f.endswith(".md")
             ],
         }
@@ -376,29 +468,63 @@ async def _handle_tool(
             arguments["repo_name"],
             arguments["library_or_pattern"],
             top_k=arguments.get("top_k", 5),
+            repo_module=arguments.get("module"),
         )
 
     elif name == "get_integration_guide":
         return await reference_builder.get_integration_guide(
             arguments["repo_name"],
             arguments["library"],
+            repo_module=arguments.get("module"),
         )
 
     elif name == "get_code_template":
         return await reference_builder.get_code_template(
             arguments["repo_name"],
             arguments["pattern_type"],
+            repo_module=arguments.get("module"),
         )
 
     elif name == "list_skills":
-        skills = doc_store.list_skills(arguments["repo_name"])
+        repo_module = arguments.get("module", "")
+        skills = doc_store.list_skills(arguments["repo_name"], repo_module=repo_module)
         return [{"name": s, "status": "available"} for s in skills]
 
     elif name == "get_skill":
-        content = doc_store.read_skill(arguments["repo_name"], arguments["skill_name"])
+        repo_module = arguments.get("module", "")
+        content = doc_store.read_skill(arguments["repo_name"], arguments["skill_name"],
+                                        repo_module=repo_module)
         if content is None:
             return {"error": "Skill not found"}
         return {"name": arguments["skill_name"], "content": content}
+
+    elif name == "list_doc_index":
+        doc_type = arguments.get("doc_type")
+        entries = store.get_doc_index(arguments["repo_name"], doc_type=doc_type)
+        return [
+            {
+                "file_path": e["file_path"],
+                "doc_type": e["doc_type"],
+                "title": e["title"],
+                "size_bytes": e["size_bytes"],
+            }
+            for e in entries
+        ]
+
+    elif name == "read_doc":
+        entry = store.get_doc_index_by_path(arguments["repo_name"], arguments["file_path"])
+        if entry is None:
+            return {"error": f"Document not found in index: {arguments['file_path']}"}
+        full_path = Path(entry["full_path"])
+        if not full_path.exists():
+            return {"error": f"File not found on disk: {full_path}"}
+        content = full_path.read_text(encoding="utf-8", errors="replace")
+        return {
+            "file_path": entry["file_path"],
+            "doc_type": entry["doc_type"],
+            "title": entry["title"],
+            "content": content,
+        }
 
     else:
         return {"error": f"Unknown tool: {name}"}

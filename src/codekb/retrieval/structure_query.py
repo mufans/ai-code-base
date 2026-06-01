@@ -18,12 +18,13 @@ class StructureQuery:
         self,
         repo_name: str,
         path: Optional[str] = None,
+        repo_module: Optional[str] = None,
     ) -> list[dict]:
         """Get code structure (classes, functions, signatures).
 
         Returns a nested structure if no path specified, or flat list for a specific file.
         """
-        symbols = self.store.get_symbols(repo_name, file_path=path)
+        symbols = self.store.get_symbols(repo_name, file_path=path, repo_module=repo_module)
 
         if path:
             # Return flat list for a specific file
@@ -42,9 +43,10 @@ class StructureQuery:
         self,
         repo_name: str,
         symbol_name: str,
+        repo_module: Optional[str] = None,
     ) -> Optional[dict]:
         """Get full symbol definition and references."""
-        symbols = self.store.get_symbol_by_name(repo_name, symbol_name)
+        symbols = self.store.get_symbol_by_name(repo_name, symbol_name, repo_module=repo_module)
         if not symbols:
             return None
 
@@ -52,11 +54,11 @@ class StructureQuery:
         primary = symbols[0]
 
         # Get callers and callees
-        callers = self.store.get_calls_to(repo_name, symbol_name)
-        callees = self.store.get_calls_from(repo_name, symbol_name)
+        callers = self.store.get_calls_to(repo_name, symbol_name, repo_module=repo_module)
+        callees = self.store.get_calls_from(repo_name, symbol_name, repo_module=repo_module)
 
         # Get imports for the symbol's file
-        imports = self.store.get_imports(repo_name, primary.file_path)
+        imports = self.store.get_imports(repo_name, primary.file_path, repo_module=repo_module)
 
         return {
             "definition": self._symbol_to_dict(primary),
@@ -129,23 +131,24 @@ class StructureQuery:
                 return readme.read_text(encoding="utf-8", errors="replace")
         return None
 
-    def get_file_tree(self, repo_name: str) -> list[dict]:
+    def get_file_tree(self, repo_name: str, repo_module: Optional[str] = None) -> list[dict]:
         """Get file tree for a repo."""
-        entries = self.store.get_file_tree(repo_name)
+        entries = self.store.get_file_tree(repo_name, repo_module=repo_module)
         return [
             {
                 "path": e.path,
                 "language": e.language,
                 "is_entry_point": e.is_entry_point,
                 "symbol_count": e.symbol_count,
+                "repo_module": e.repo_module,
             }
             for e in entries
         ]
 
-    def get_stats(self, repo_name: str) -> dict:
+    def get_stats(self, repo_name: str, repo_module: Optional[str] = None) -> dict:
         """Get structure stats for a repo."""
-        symbols = self.store.get_symbols(repo_name)
-        files = self.store.get_file_tree(repo_name)
+        symbols = self.store.get_symbols(repo_name, repo_module=repo_module)
+        files = self.store.get_file_tree(repo_name, repo_module=repo_module)
 
         kinds = {}
         for s in symbols:
@@ -164,6 +167,45 @@ class StructureQuery:
             "entry_points": [f.path for f in files if f.is_entry_point],
         }
 
+    def list_modules(self, repo_name: str) -> list[str]:
+        """List all modules in a repo."""
+        return self.store.list_modules(repo_name)
+
+    def get_module_dependencies(self, repo_name: str) -> list[dict]:
+        """Analyze cross-module dependencies based on import statements.
+
+        Returns a list of dependency edges between modules.
+        """
+        from codekb.core.module_detector import file_to_module, ModuleInfo
+
+        modules_data = self.store.get_repo_modules(repo_name)
+        if not modules_data:
+            return []
+
+        modules = [ModuleInfo(name=m["name"], path=m.get("path", "")) for m in modules_data]
+        imports = self.store.get_imports(repo_name)
+
+        # Build module-level dependency map
+        deps: dict[tuple[str, str], list[str]] = {}
+        for imp in imports:
+            if not imp.repo_module:
+                continue
+            # Check if the import targets another module
+            for mod in modules:
+                if mod.name == imp.repo_module:
+                    continue
+                if mod.path and imp.module.startswith(mod.path.replace("/", ".")):
+                    key = (imp.repo_module, mod.name)
+                    if key not in deps:
+                        deps[key] = []
+                    if imp.file_path not in deps[key]:
+                        deps[key].append(imp.file_path)
+
+        return [
+            {"from": src, "to": dst, "files": files}
+            for (src, dst), files in sorted(deps.items())
+        ]
+
     def _symbol_to_dict(self, sym: Symbol) -> dict:
         return {
             "name": sym.name,
@@ -174,4 +216,5 @@ class StructureQuery:
             "end_line": sym.end_line,
             "parent": sym.parent,
             "docstring": sym.docstring,
+            "repo_module": sym.repo_module,
         }

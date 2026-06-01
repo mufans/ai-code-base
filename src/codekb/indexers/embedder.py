@@ -99,12 +99,14 @@ def chunk_symbols(symbols: list[Symbol]) -> list[CodeChunk]:
             start_line=sym.start_line,
             end_line=sym.end_line,
             language=sym.language,
+            repo_module=sym.repo_module,
         )
         chunks.append(chunk)
     return chunks
 
 
-def chunk_markdown(content: str, repo_name: str, file_path: str) -> list[DocChunk]:
+def chunk_markdown(content: str, repo_name: str, file_path: str,
+                   repo_module: str = "") -> list[DocChunk]:
     """Chunk markdown content by section headings."""
     # Split by headings
     sections = re.split(r'(?=^#{1,3}\s)', content, flags=re.MULTILINE)
@@ -128,6 +130,7 @@ def chunk_markdown(content: str, repo_name: str, file_path: str) -> list[DocChun
             title=current_title,
             content=section,
             section=current_title,
+            repo_module=repo_module,
         )
         chunks.append(chunk)
 

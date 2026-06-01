@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from codekb.core.config import CodekbYamlConfig, Settings, ensure_data_dir, load_settings
+from codekb.core.module_detector import ModuleInfo, detect_modules
 from codekb.core.repo_manager import RepoManager
 from codekb.indexers.embedder import EmbeddingIndexer, create_embedding_provider
 from codekb.indexers.tree_sitter import TreeSitterIndexer
@@ -42,9 +43,10 @@ class IndexOrchestrator:
         """Run full index pipeline for a repo.
 
         Steps:
-        1. Tree-sitter structure parsing
-        2. Code embedding
-        3. README/doc embedding
+        1. Module detection
+        2. Tree-sitter structure parsing
+        3. Code embedding
+        4. README/doc embedding
         """
         repo = self.store.get_repo(repo_name)
         if repo is None:
@@ -54,6 +56,20 @@ class IndexOrchestrator:
         if not repo_path.exists():
             raise FileNotFoundError(f"Repo path not found: {repo_path}")
 
+        # Detect modules
+        configured_dicts = None
+        module_configs = self.config.repo_modules.get(repo_name)
+        if module_configs:
+            configured_dicts = [m.model_dump() for m in module_configs]
+        modules = detect_modules(repo_path, configured_dicts)
+
+        # Save module detection results
+        modules_data = [
+            {"name": m.name, "path": m.path, "language": m.language, "source": m.source}
+            for m in modules if m.name
+        ]
+        self.store.save_repo_modules(repo_name, modules_data)
+
         # Update status
         self.store.update_repo(repo_name, status="indexing")
         self.store.set_index_status(repo_name, "tree_sitter", "running")
@@ -62,11 +78,15 @@ class IndexOrchestrator:
             # Step 1: Tree-sitter parsing
             stats = self.ts_indexer.index_repo(
                 repo_name, repo_path, self.config.index.exclude_patterns,
+                modules=modules if any(m.name for m in modules) else None,
             )
             self.store.set_index_status(
                 repo_name, "tree_sitter", "completed",
                 items_processed=stats["files_indexed"],
             )
+
+            # Step 1b: Doc index (lightweight, no vectorization)
+            self.store.index_docs(repo_name, repo_path)
 
             # Step 2: Code embedding
             self.store.set_index_status(repo_name, "embedding_code", "running")
@@ -102,6 +122,7 @@ class IndexOrchestrator:
                 "symbols_found": stats["symbols_found"],
                 "code_chunks_embedded": code_count,
                 "doc_chunks_embedded": doc_count,
+                "modules": [m.name for m in modules if m.name],
             }
 
         except Exception as e:
@@ -121,6 +142,11 @@ class IndexOrchestrator:
             raise ValueError(f"Repo not found: {repo_name}")
 
         repo_path = Path(repo.local_path)
+
+        # Load modules for file_to_module mapping
+        modules_data = self.store.get_repo_modules(repo_name)
+        modules = [ModuleInfo(name=m["name"], path=m.get("path", "")) for m in modules_data]
+
         source_extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php"}
         doc_extensions = {".md", ".rst", ".txt"}
 
@@ -142,8 +168,14 @@ class IndexOrchestrator:
                     await emb_indexer.delete_file_vectors(repo_name, rel_path)
                     continue
 
+                # Determine module for this file
+                mod_name = ""
+                if modules:
+                    from codekb.core.module_detector import file_to_module
+                    mod_name = file_to_module(rel_path, modules)
+
                 # Re-parse
-                self.ts_indexer.reindex_file(repo_name, file_path, rel_path)
+                self.ts_indexer.reindex_file(repo_name, file_path, rel_path, repo_module=mod_name)
 
                 # Re-embed
                 symbols = self.store.get_symbols(repo_name, rel_path)
@@ -165,8 +197,15 @@ class IndexOrchestrator:
                 file_path = repo_path / rel_path
                 if file_path.exists():
                     content = file_path.read_text(encoding="utf-8", errors="replace")
+
+                    # Determine module for this file
+                    mod_name = ""
+                    if modules:
+                        from codekb.core.module_detector import file_to_module
+                        mod_name = file_to_module(rel_path, modules)
+
                     from codekb.indexers.embedder import chunk_markdown
-                    chunks = chunk_markdown(content, repo_name, rel_path)
+                    chunks = chunk_markdown(content, repo_name, rel_path, repo_module=mod_name)
                     await doc_indexer.delete_file_vectors(repo_name, rel_path)
                     if chunks:
                         texts = [c.content for c in chunks]

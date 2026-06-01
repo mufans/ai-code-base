@@ -23,6 +23,7 @@ class ReferenceBuilder:
         repo_name: str,
         library_or_pattern: str,
         top_k: int = 5,
+        repo_module: Optional[str] = None,
     ) -> list[dict]:
         """Find real usage examples of a library or pattern in the codebase.
 
@@ -31,6 +32,7 @@ class ReferenceBuilder:
         results = await self.search.search(
             query=f"usage example {library_or_pattern}",
             repo_name=repo_name,
+            repo_module=repo_module,
             top_k=top_k,
         )
 
@@ -57,14 +59,15 @@ class ReferenceBuilder:
         self,
         repo_name: str,
         library: str,
+        repo_module: Optional[str] = None,
     ) -> dict:
         """Build an integration guide for using a library in this project.
 
         Aggregates: config items, init code, usage examples, dependencies.
         """
         # Find all imports of this library
-        symbols = self.store.get_symbols(repo_name)
-        imports = self.store.get_imports(repo_name)
+        symbols = self.store.get_symbols(repo_name, repo_module=repo_module)
+        imports = self.store.get_imports(repo_name, repo_module=repo_module)
 
         related_imports = [
             i for i in imports
@@ -77,7 +80,8 @@ class ReferenceBuilder:
             related_files.add(imp.file_path)
 
         # Search for usage examples
-        examples = await self.get_usage_examples(repo_name, library, top_k=5)
+        examples = await self.get_usage_examples(repo_name, library, top_k=5,
+                                                  repo_module=repo_module)
 
         # Get config items from code
         config_items = []
@@ -105,6 +109,7 @@ class ReferenceBuilder:
         self,
         repo_name: str,
         pattern_type: str,
+        repo_module: Optional[str] = None,
     ) -> dict:
         """Get typical code patterns for a project.
 
@@ -114,6 +119,7 @@ class ReferenceBuilder:
         results = await self.search.search(
             query=f"{pattern_type} pattern implementation",
             repo_name=repo_name,
+            repo_module=repo_module,
             top_k=5,
         )
 
@@ -130,7 +136,7 @@ class ReferenceBuilder:
             })
 
         # Get conventions from existing code structure
-        stats = self.structure.get_stats(repo_name)
+        stats = self.structure.get_stats(repo_name, repo_module=repo_module)
 
         return {
             "pattern_type": pattern_type,

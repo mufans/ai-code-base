@@ -173,7 +173,8 @@ class DocGenerator:
         self.config = config
         self.coverage_assessor = CoverageAssessment(store, doc_store)
 
-    async def generate_docs(self, repo_name: str, llm_client=None) -> dict:
+    async def generate_docs(self, repo_name: str, llm_client=None,
+                            repo_module: str = "") -> dict:
         """Generate missing architecture docs for a repo.
 
         Pipeline:
@@ -196,8 +197,8 @@ class DocGenerator:
         coverage = await self.coverage_assessor.assess(repo_name, readme_content, llm_client)
 
         # Step 3: Get structure summary for context
-        symbols = self.store.get_symbols(repo_name)
-        calls = self._get_call_summary(repo_name)
+        symbols = self.store.get_symbols(repo_name, repo_module=repo_module or None)
+        calls = self._get_call_summary(repo_name, repo_module or None)
         symbol_summary = self.coverage_assessor._build_symbol_summary(symbols)
 
         # Step 4: Generate missing docs
@@ -213,7 +214,7 @@ class DocGenerator:
                     quality = self._verify_doc(repo_name, content)
                     # Add frontmatter
                     content = self._add_frontmatter(content, quality, dim)
-                    self.doc_store.write_doc(repo_name, doc_name, content)
+                    self.doc_store.write_doc(repo_name, doc_name, content, repo_module=repo_module)
                     coverage["generated"].append(dim)
                     generated.append({"dimension": dim, "doc": doc_name, "quality": quality["tag"]})
 
@@ -227,13 +228,13 @@ class DocGenerator:
                 if content:
                     quality = self._verify_doc(repo_name, content)
                     content = self._add_frontmatter(content, quality, dim)
-                    self.doc_store.write_doc(repo_name, doc_name, content)
+                    self.doc_store.write_doc(repo_name, doc_name, content, repo_module=repo_module)
                     coverage["enriched"].remove(dim)
                     coverage["generated"].append(dim)
                     generated.append({"dimension": dim, "doc": doc_name, "quality": quality["tag"]})
 
         # Store coverage
-        self.doc_store.write_coverage(repo_name, coverage)
+        self.doc_store.write_coverage(repo_name, coverage, repo_module=repo_module)
 
         return {
             "repo": repo_name,
@@ -466,13 +467,13 @@ unverified_steps: {json.dumps(quality.get('unverified_steps', []))}
         }
         return mapping.get(dimension)
 
-    def _get_call_summary(self, repo_name: str) -> str:
+    def _get_call_summary(self, repo_name: str, repo_module: Optional[str] = None) -> str:
         """Get a summary of the call graph."""
-        symbols = self.store.get_symbols(repo_name)
+        symbols = self.store.get_symbols(repo_name, repo_module=repo_module)
         lines = []
         for sym in symbols:
             if sym.kind in ("function", "method"):
-                calls = self.store.get_calls_from(repo_name, sym.name)
+                calls = self.store.get_calls_from(repo_name, sym.name, repo_module=repo_module)
                 if calls:
                     callees = [c.callee_name for c in calls[:10]]
                     lines.append(f"  {sym.name} → {', '.join(callees)}")

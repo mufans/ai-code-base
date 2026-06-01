@@ -21,6 +21,7 @@ class CodeChunk(BaseModel):
     end_line: int
     language: str
     chunk_type: str = "code"  # code, doc, readme
+    repo_module: str = ""
 
 
 class DocChunk(BaseModel):
@@ -32,6 +33,7 @@ class DocChunk(BaseModel):
     content: str
     section: str = ""
     chunk_type: str = "doc"
+    repo_module: str = ""
 
 
 class SearchResult(BaseModel):
@@ -42,6 +44,7 @@ class SearchResult(BaseModel):
     content: str
     score: float
     metadata: dict = {}
+    repo_module: str = ""
 
 
 class VectorStore:
@@ -85,6 +88,7 @@ class VectorStore:
                 "end_line": c.end_line,
                 "language": c.language,
                 "chunk_type": c.chunk_type,
+                "repo_module": c.repo_module,
             } for c in chunks],
         )
 
@@ -102,15 +106,14 @@ class VectorStore:
                 "title": c.title,
                 "section": c.section,
                 "chunk_type": c.chunk_type,
+                "repo_module": c.repo_module,
             } for c in chunks],
         )
 
     def search_code(self, query_embedding: list[float], repo_name: Optional[str] = None,
-                    top_k: int = 10) -> list[SearchResult]:
+                    repo_module: Optional[str] = None, top_k: int = 10) -> list[SearchResult]:
         """Search code chunks by embedding."""
-        where_filter = None
-        if repo_name:
-            where_filter = {"repo_name": repo_name}
+        where_filter = self._build_where_filter(repo_name, repo_module)
 
         results = self._code_collection.query(
             query_embeddings=[query_embedding],
@@ -129,17 +132,16 @@ class VectorStore:
                     repo_name=metadata.get("repo_name", ""),
                     file_path=metadata.get("file_path", ""),
                     content=document,
-                    score=1 - distance,  # cosine distance → similarity
+                    score=1 - distance,  # cosine distance -> similarity
                     metadata=metadata,
+                    repo_module=metadata.get("repo_module", ""),
                 ))
         return search_results
 
     def search_docs(self, query_embedding: list[float], repo_name: Optional[str] = None,
-                    top_k: int = 10) -> list[SearchResult]:
+                    repo_module: Optional[str] = None, top_k: int = 10) -> list[SearchResult]:
         """Search doc chunks by embedding."""
-        where_filter = None
-        if repo_name:
-            where_filter = {"repo_name": repo_name}
+        where_filter = self._build_where_filter(repo_name, repo_module)
 
         count = self._doc_collection.count()
         if count == 0:
@@ -164,8 +166,24 @@ class VectorStore:
                     content=document,
                     score=1 - distance,
                     metadata=metadata,
+                    repo_module=metadata.get("repo_module", ""),
                 ))
         return search_results
+
+    def _build_where_filter(self, repo_name: Optional[str], repo_module: Optional[str]):
+        """Build a ChromaDB where filter from repo_name and repo_module."""
+        conditions = []
+        if repo_name:
+            conditions.append({"repo_name": repo_name})
+        if repo_module is not None:
+            conditions.append({"repo_module": repo_module})
+
+        if len(conditions) == 0:
+            return None
+        elif len(conditions) == 1:
+            return conditions[0]
+        else:
+            return {"$and": conditions}
 
     def delete_repo_chunks(self, repo_name: str):
         """Delete all chunks for a repo from both collections."""
