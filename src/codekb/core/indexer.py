@@ -10,6 +10,7 @@ from codekb.core.module_detector import ModuleInfo, detect_modules
 from codekb.core.repo_manager import RepoManager
 from codekb.indexers.embedder import EmbeddingIndexer, create_embedding_provider
 from codekb.indexers.tree_sitter import TreeSitterIndexer
+from codekb.resolution.import_resolver import ImportResolver
 from codekb.storage.doc_store import DocStore
 from codekb.storage.sqlite_store import SqliteStore
 from codekb.storage.vector_store import VectorStore
@@ -38,6 +39,11 @@ class IndexOrchestrator:
     def _get_embedding_indexer(self, purpose: str = "code_embedding") -> EmbeddingIndexer:
         provider = create_embedding_provider(self.config, self.settings, purpose)
         return EmbeddingIndexer(self.store, self.vector_store, provider)
+
+    def _resolve_imports(self, repo_name: str, repo_path: Path):
+        """Post-process imports to resolve module paths to actual files."""
+        resolver = ImportResolver(self.store)
+        resolver.resolve_imports(repo_name, repo_path)
 
     async def full_index(self, repo_name: str) -> dict:
         """Run full index pipeline for a repo.
@@ -87,6 +93,9 @@ class IndexOrchestrator:
 
             # Step 1b: Doc index (lightweight, no vectorization)
             self.store.index_docs(repo_name, repo_path)
+
+            # Step 1c: Import resolution (post-process imports to resolve paths)
+            self._resolve_imports(repo_name, repo_path)
 
             # Step 2: Code embedding
             self.store.set_index_status(repo_name, "embedding_code", "running")
@@ -165,6 +174,7 @@ class IndexOrchestrator:
                     self.store.delete_symbols_for_file(repo_name, rel_path)
                     self.store.delete_calls_for_file(repo_name, rel_path)
                     self.store.delete_imports_for_file(repo_name, rel_path)
+                    self.store.delete_edges_for_file(repo_name, rel_path)
                     await emb_indexer.delete_file_vectors(repo_name, rel_path)
                     continue
 

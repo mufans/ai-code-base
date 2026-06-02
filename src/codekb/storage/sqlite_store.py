@@ -60,6 +60,19 @@ class CallRelation(BaseModel):
     repo_module: str = ""
 
 
+class EdgeRelation(BaseModel):
+    """A typed edge between two symbols (extends, implements, references, overrides, type_of, calls)."""
+    id: Optional[int] = None
+    repo_name: str
+    source_symbol: str  # fully-qualified or local name of the source symbol
+    source_file: str = ""
+    target_symbol: str  # name of the target symbol
+    target_file: str = ""
+    kind: str  # calls, extends, implements, references, overrides, type_of
+    line_number: int = 0
+    repo_module: str = ""
+
+
 class ImportRecord(BaseModel):
     """An import statement."""
     id: Optional[int] = None
@@ -70,6 +83,8 @@ class ImportRecord(BaseModel):
     line_number: int = 0
     is_relative: bool = False
     repo_module: str = ""
+    resolved_path: str = ""  # resolved file path (set by import resolver)
+    resolved_symbol: str = ""  # resolved symbol name (set by import resolver)
 
 
 class FileEntry(BaseModel):
@@ -195,6 +210,24 @@ class SqliteStore:
                 repo_module TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo_name TEXT NOT NULL,
+                source_symbol TEXT NOT NULL,
+                source_file TEXT DEFAULT '',
+                target_symbol TEXT NOT NULL,
+                target_file TEXT DEFAULT '',
+                kind TEXT NOT NULL,
+                line_number INTEGER DEFAULT 0,
+                repo_module TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_edges_repo ON edges(repo_name);
+            CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(repo_name, source_symbol);
+            CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(repo_name, target_symbol);
+            CREATE INDEX IF NOT EXISTS idx_edges_kind ON edges(repo_name, kind);
+            CREATE INDEX IF NOT EXISTS idx_edges_repo_module ON edges(repo_name, repo_module);
+
             CREATE TABLE IF NOT EXISTS file_tree (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 repo_name TEXT NOT NULL,
@@ -222,6 +255,7 @@ class SqliteStore:
         # Migrate existing databases
         self._migrate_add_repo_module()
         self._migrate_add_is_exported()
+        self._migrate_add_import_resolution()
 
     # --- Repo operations ---
 
@@ -439,9 +473,9 @@ class SqliteStore:
             return
         conn = self._connect(self._struct_path)
         conn.executemany(
-            """INSERT INTO imports (repo_name, file_path, module, imported_names, line_number, is_relative, repo_module)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            [(i.repo_name, i.file_path, i.module, i.imported_names, i.line_number, int(i.is_relative), i.repo_module) for i in imports],
+            """INSERT INTO imports (repo_name, file_path, module, imported_names, line_number, is_relative, repo_module, resolved_path, resolved_symbol)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(i.repo_name, i.file_path, i.module, i.imported_names, i.line_number, int(i.is_relative), i.repo_module, i.resolved_path, i.resolved_symbol) for i in imports],
         )
         conn.commit()
         conn.close()
@@ -468,6 +502,65 @@ class SqliteStore:
         conn = self._connect(self._struct_path)
         conn.execute(
             "DELETE FROM imports WHERE repo_name = ? AND file_path = ?",
+            (repo_name, file_path),
+        )
+        conn.commit()
+        conn.close()
+
+    # --- Edge operations ---
+
+    def insert_edges(self, edges: list[EdgeRelation]):
+        if not edges:
+            return
+        conn = self._connect(self._struct_path)
+        conn.executemany(
+            """INSERT INTO edges (repo_name, source_symbol, source_file, target_symbol, target_file, kind, line_number, repo_module)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            [(e.repo_name, e.source_symbol, e.source_file, e.target_symbol, e.target_file, e.kind, e.line_number, e.repo_module) for e in edges],
+        )
+        conn.commit()
+        conn.close()
+
+    def get_edges_from(self, repo_name: str, source_symbol: str,
+                       kind: Optional[str] = None,
+                       repo_module: Optional[str] = None) -> list[EdgeRelation]:
+        conn = self._connect(self._struct_path)
+        query = "SELECT * FROM edges WHERE repo_name = ? AND source_symbol = ?"
+        params: list = [repo_name, source_symbol]
+
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+        return [EdgeRelation(**dict(r)) for r in rows]
+
+    def get_edges_to(self, repo_name: str, target_symbol: str,
+                     kind: Optional[str] = None,
+                     repo_module: Optional[str] = None) -> list[EdgeRelation]:
+        conn = self._connect(self._struct_path)
+        query = "SELECT * FROM edges WHERE repo_name = ? AND target_symbol = ?"
+        params: list = [repo_name, target_symbol]
+
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        if repo_module is not None:
+            query += " AND repo_module = ?"
+            params.append(repo_module)
+
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+        return [EdgeRelation(**dict(r)) for r in rows]
+
+    def delete_edges_for_file(self, repo_name: str, file_path: str):
+        conn = self._connect(self._struct_path)
+        conn.execute(
+            "DELETE FROM edges WHERE repo_name = ? AND source_file = ?",
             (repo_name, file_path),
         )
         conn.commit()
@@ -521,7 +614,7 @@ class SqliteStore:
     def clear_repo_structure(self, repo_name: str):
         """Remove all structure data for a repo (for full re-index)."""
         conn = self._connect(self._struct_path)
-        for table in ["symbols", "calls", "imports", "file_tree"]:
+        for table in ["symbols", "calls", "imports", "edges", "file_tree"]:
             conn.execute(f"DELETE FROM {table} WHERE repo_name = ?", (repo_name,))
         conn.commit()
         conn.close()
@@ -687,6 +780,17 @@ class SqliteStore:
             conn.execute("ALTER TABLE symbols ADD COLUMN is_exported INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # Column already exists
+        conn.commit()
+        conn.close()
+
+    def _migrate_add_import_resolution(self):
+        """Add resolved_path and resolved_symbol columns to imports table (idempotent)."""
+        conn = self._connect(self._struct_path)
+        for col in ["resolved_path", "resolved_symbol"]:
+            try:
+                conn.execute(f"ALTER TABLE imports ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
         conn.commit()
         conn.close()
 

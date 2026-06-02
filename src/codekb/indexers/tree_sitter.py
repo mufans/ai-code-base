@@ -13,7 +13,11 @@ import tree_sitter_java as tsjava
 import tree_sitter_kotlin as tskotlin
 import tree_sitter_swift as tsswift
 import tree_sitter_typescript as tstypescript
-import tree_sitter_arkts as tsarkts
+
+try:
+    import tree_sitter_arkts as tsarkts
+except ImportError:
+    tsarkts = None  # type: ignore[assignment]
 
 from codekb.storage.sqlite_store import (
     SqliteStore,
@@ -21,6 +25,7 @@ from codekb.storage.sqlite_store import (
     CallRelation,
     ImportRecord,
     FileEntry,
+    EdgeRelation,
 )
 
 from codekb.core.module_detector import ModuleInfo, file_to_module
@@ -50,6 +55,11 @@ class LanguageStrategy(Protocol):
     def extract_imports(
         self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
     ) -> list[ImportRecord]:
+        ...
+
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
         ...
 
 
@@ -247,8 +257,52 @@ class PythonStrategy:
             for child in node.children:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends/implements edges from class definitions.
 
-# --- JavaScript Strategy ---
+        Python convention: class Foo(Bar) → extends Bar
+        For Python ABC-based patterns, we check if any base name suggests an interface
+        (contains 'Interface', 'Protocol', 'ABC', 'Mixin' or starts with 'I').
+        """
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
+
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_definition":
+            class_name = self._get_field_text(node, "name", source)
+            superclasses_node = node.child_by_field_name("superclasses")
+            if superclasses_node:
+                for child in superclasses_node.children:
+                    base_name = bytes(child.text).decode("utf-8", errors="replace").strip()
+                    if not base_name or base_name in ("(", ")", ","):
+                        continue
+                    # Determine if it's extends or implements
+                    kind = self._classify_python_base(base_name)
+                    edges.append(EdgeRelation(
+                        repo_name=repo_name,
+                        source_symbol=class_name,
+                        source_file=file_path,
+                        target_symbol=base_name,
+                        kind=kind,
+                        line_number=node.start_point[0] + 1,
+                    ))
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
+
+    def _classify_python_base(self, base_name: str) -> str:
+        """Classify a Python base class as extends or implements."""
+        interface_indicators = ("Interface", "Protocol", "ABC", "Mixin", "Abstract")
+        if any(ind in base_name for ind in interface_indicators):
+            return "implements"
+        if base_name.startswith("I") and len(base_name) > 1 and base_name[1].isupper():
+            return "implements"
+        return "extends"
 
 class JavaScriptStrategy:
     def language(self) -> ts.Language:
@@ -430,8 +484,36 @@ class JavaScriptStrategy:
         for child in node.children:
             self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends edges from class declarations."""
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
 
-# --- Java Strategy ---
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_declaration":
+            class_name = self._get_field_text(node, "name", source)
+            # JS class extends: class Foo extends Bar
+            for child in node.children:
+                if child.type == "class_heritage":
+                    for heritage_child in child.children:
+                        if heritage_child.type not in (",", "extends"):
+                            base_name = bytes(heritage_child.text).decode("utf-8", errors="replace")
+                            edges.append(EdgeRelation(
+                                repo_name=repo_name,
+                                source_symbol=class_name,
+                                source_file=file_path,
+                                target_symbol=base_name,
+                                kind="extends",
+                                line_number=node.start_point[0] + 1,
+                            ))
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
 
 class JavaStrategy:
     def language(self) -> ts.Language:
@@ -620,8 +702,62 @@ class JavaStrategy:
             for child in node.children:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends/implements edges from Java class declarations."""
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
 
-# --- Kotlin Strategy ---
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_declaration":
+            class_name = self._get_name(node, source)
+            # Java: extends and implements clauses
+            for child in node.children:
+                if child.type == "superclass":
+                    # extends Bar
+                    for sc in child.children:
+                        if sc.type in ("identifier", "scoped_identifier", "type_identifier"):
+                            base = bytes(sc.text).decode("utf-8", errors="replace")
+                            edges.append(EdgeRelation(
+                                repo_name=repo_name,
+                                source_symbol=class_name,
+                                source_file=file_path,
+                                target_symbol=base,
+                                kind="extends",
+                                line_number=node.start_point[0] + 1,
+                            ))
+                elif child.type == "super_interfaces":
+                    # implements Foo, Bar
+                    for iface_child in child.children:
+                        if iface_child.type in ("identifier", "scoped_identifier", "type_identifier"):
+                            iface_name = bytes(iface_child.text).decode("utf-8", errors="replace")
+                            edges.append(EdgeRelation(
+                                repo_name=repo_name,
+                                source_symbol=class_name,
+                                source_file=file_path,
+                                target_symbol=iface_name,
+                                kind="implements",
+                                line_number=node.start_point[0] + 1,
+                            ))
+                        elif iface_child.type == "type_list":
+                            for tl_child in iface_child.children:
+                                if tl_child.type in ("identifier", "scoped_identifier", "type_identifier"):
+                                    iface_name = bytes(tl_child.text).decode("utf-8", errors="replace")
+                                    edges.append(EdgeRelation(
+                                        repo_name=repo_name,
+                                        source_symbol=class_name,
+                                        source_file=file_path,
+                                        target_symbol=iface_name,
+                                        kind="implements",
+                                        line_number=node.start_point[0] + 1,
+                                    ))
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
 
 class KotlinStrategy:
     def language(self) -> ts.Language:
@@ -796,8 +932,71 @@ class KotlinStrategy:
             for child in node.children:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends/implements edges from Kotlin class declarations."""
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
 
-# --- Swift Strategy ---
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_declaration":
+            class_name = self._get_name(node, source)
+            for child in node.children:
+                if child.type == "superclass":
+                    # : ParentClass
+                    for sc in child.children:
+                        if sc.type in ("identifier", "simple_identifier", "user_type", "type_identifier"):
+                            base = bytes(sc.text).decode("utf-8", errors="replace")
+                            edges.append(EdgeRelation(
+                                repo_name=repo_name,
+                                source_symbol=class_name,
+                                source_file=file_path,
+                                target_symbol=base,
+                                kind="extends",
+                                line_number=node.start_point[0] + 1,
+                            ))
+                elif child.type == "superclass_call":
+                    # : ParentClass()
+                    base = bytes(child.text).decode("utf-8", errors="replace").split("(")[0]
+                    if base:
+                        edges.append(EdgeRelation(
+                            repo_name=repo_name,
+                            source_symbol=class_name,
+                            source_file=file_path,
+                            target_symbol=base,
+                            kind="extends",
+                            line_number=node.start_point[0] + 1,
+                        ))
+                elif child.type == "delegation_callers":
+                    # : Interface by delegate
+                    for dc in child.children:
+                        if dc.type == "delegation_call":
+                            iface_name = bytes(dc.text).decode("utf-8", errors="replace").split("by")[0].strip()
+                            if iface_name:
+                                edges.append(EdgeRelation(
+                                    repo_name=repo_name,
+                                    source_symbol=class_name,
+                                    source_file=file_path,
+                                    target_symbol=iface_name,
+                                    kind="implements",
+                                    line_number=node.start_point[0] + 1,
+                                ))
+                elif child.type in ("type_constraints",):
+                    # Generic constraints - not inheritance
+                    pass
+            # Also check modifiers for 'data', 'sealed' etc.
+            # Look for colon (:) children that indicate supertype specification
+            for child in node.children:
+                if child.type == ":" :
+                    # The next sibling after : should be the supertype
+                    pass
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
 
 class SwiftStrategy:
     def language(self) -> ts.Language:
@@ -1006,8 +1205,51 @@ class SwiftStrategy:
             for child in node.children:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends/implements edges from Swift class/struct declarations."""
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
 
-# --- TypeScript Strategy ---
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_declaration":
+            class_name = self._get_type_name(node, source)
+            # Swift: class Foo: Bar, Protocol1, Protocol2
+            # The inheritance clause comes after the type identifier
+            found_name = False
+            for child in node.children:
+                if child.type == "type_identifier":
+                    found_name = True
+                    continue
+                if found_name and child.type == "type_constraints":
+                    break
+                if found_name and child.type == "class_body":
+                    break
+                if found_name and child.type == "inheritance_clause":
+                    for ic in child.children:
+                        if ic.type == "class_body":
+                            break
+                        if ic.type in (",", "inheritance_clause"):
+                            continue
+                        base = bytes(ic.text).decode("utf-8", errors="replace").strip()
+                        if base and base != ":":
+                            # In Swift, first item after : is superclass, rest are protocols
+                            edges.append(EdgeRelation(
+                                repo_name=repo_name,
+                                source_symbol=class_name,
+                                source_file=file_path,
+                                target_symbol=base,
+                                kind="extends",  # simplified: treat all as extends
+                                line_number=node.start_point[0] + 1,
+                            ))
+                    break
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
 
 class TypeScriptStrategy:
     """Strategy for both TypeScript (.ts) and TSX (.tsx) files."""
@@ -1246,8 +1488,49 @@ class TypeScriptStrategy:
             for child in node.children:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends/implements edges from TypeScript class declarations."""
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
 
-# --- ArkTS Strategy ---
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_declaration":
+            class_name = self._get_name(node, source)
+            for child in node.children:
+                if child.type == "class_heritage":
+                    for heritage_child in child.children:
+                        if heritage_child.type == "extends_clause":
+                            for ext_child in heritage_child.children:
+                                if ext_child.type in ("identifier", "type_identifier"):
+                                    base = bytes(ext_child.text).decode("utf-8", errors="replace")
+                                    edges.append(EdgeRelation(
+                                        repo_name=repo_name,
+                                        source_symbol=class_name,
+                                        source_file=file_path,
+                                        target_symbol=base,
+                                        kind="extends",
+                                        line_number=node.start_point[0] + 1,
+                                    ))
+                        elif heritage_child.type == "implements_clause":
+                            for impl_child in heritage_child.children:
+                                if impl_child.type in ("identifier", "type_identifier"):
+                                    iface = bytes(impl_child.text).decode("utf-8", errors="replace")
+                                    edges.append(EdgeRelation(
+                                        repo_name=repo_name,
+                                        source_symbol=class_name,
+                                        source_file=file_path,
+                                        target_symbol=iface,
+                                        kind="implements",
+                                        line_number=node.start_point[0] + 1,
+                                    ))
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
 
 class ArkTSStrategy:
     """Strategy for ArkTS (.ets) files using tree-sitter-arkts grammar."""
@@ -1513,8 +1796,49 @@ class ArkTSStrategy:
             for child in node.children:
                 self._walk_for_imports(child, source, file_path, repo_name, imports)
 
+    def extract_inheritance(
+        self, tree: ts.Tree, source: bytes, file_path: str, repo_name: str
+    ) -> list[EdgeRelation]:
+        """Extract extends/implements edges from ArkTS class declarations."""
+        edges: list[EdgeRelation] = []
+        self._walk_for_inheritance(tree.root_node, source, file_path, repo_name, edges)
+        return edges
 
-# --- Indexer ---
+    def _walk_for_inheritance(
+        self, node: ts.Node, source: bytes, file_path: str,
+        repo_name: str, edges: list[EdgeRelation]
+    ):
+        if node.type == "class_declaration":
+            class_name = self._node_name(node, source)
+            for child in node.children:
+                if child.type == "class_heritage":
+                    for heritage_child in child.children:
+                        if heritage_child.type == "extends_clause":
+                            for ext_child in heritage_child.children:
+                                if ext_child.type in ("identifier", "type_identifier"):
+                                    base = bytes(ext_child.text).decode("utf-8", errors="replace")
+                                    edges.append(EdgeRelation(
+                                        repo_name=repo_name,
+                                        source_symbol=class_name,
+                                        source_file=file_path,
+                                        target_symbol=base,
+                                        kind="extends",
+                                        line_number=node.start_point[0] + 1,
+                                    ))
+                        elif heritage_child.type == "implements_clause":
+                            for impl_child in heritage_child.children:
+                                if impl_child.type in ("identifier", "type_identifier"):
+                                    iface = bytes(impl_child.text).decode("utf-8", errors="replace")
+                                    edges.append(EdgeRelation(
+                                        repo_name=repo_name,
+                                        source_symbol=class_name,
+                                        source_file=file_path,
+                                        target_symbol=iface,
+                                        kind="implements",
+                                        line_number=node.start_point[0] + 1,
+                                    ))
+        for child in node.children:
+            self._walk_for_inheritance(child, source, file_path, repo_name, edges)
 
 EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".py": "python",
@@ -1547,8 +1871,9 @@ class TreeSitterIndexer:
             "swift": SwiftStrategy(),
             "typescript": TypeScriptStrategy(),
             "tsx": TypeScriptStrategy(is_tsx=True),
-            "arkts": ArkTSStrategy(),
         }
+        if tsarkts is not None:
+            self._strategies["arkts"] = ArkTSStrategy()
         self._parsers: dict[str, ts.Parser] = {}
         for lang_name, strategy in self._strategies.items():
             parser = ts.Parser(strategy.language())
@@ -1594,6 +1919,7 @@ class TreeSitterIndexer:
         all_symbols: list[Symbol] = []
         all_calls: list[CallRelation] = []
         all_imports: list[ImportRecord] = []
+        all_edges: list[EdgeRelation] = []
 
         for root, dirs, files in os.walk(repo_path):
             # Skip non-source dirs
@@ -1635,10 +1961,13 @@ class TreeSitterIndexer:
                     call.repo_module = mod_name
                 for imp in file_stats["imports"]:
                     imp.repo_module = mod_name
+                for edge in file_stats.get("edges", []):
+                    edge.repo_module = mod_name
 
                 all_symbols.extend(file_stats["symbols"])
                 all_calls.extend(file_stats["calls"])
                 all_imports.extend(file_stats["imports"])
+                all_edges.extend(file_stats.get("edges", []))
 
                 # Record file entry
                 is_entry = filepath.stem.lower() in ENTRY_POINT_NAMES
@@ -1660,6 +1989,7 @@ class TreeSitterIndexer:
         self.store.insert_symbols(all_symbols)
         self.store.insert_calls(all_calls)
         self.store.insert_imports(all_imports)
+        self.store.insert_edges(all_edges)
 
         # Resolve module exports to mark public API symbols
         self._resolve_exports(repo_name, repo_path, modules)
@@ -1693,8 +2023,9 @@ class TreeSitterIndexer:
         symbols = strategy.extract_symbols(tree, source, rel_path, repo_name, lang_name)
         calls = strategy.extract_calls(tree, source, rel_path, repo_name)
         imports = strategy.extract_imports(tree, source, rel_path, repo_name)
+        edges = strategy.extract_inheritance(tree, source, rel_path, repo_name)
 
-        return {"symbols": symbols, "calls": calls, "imports": imports}
+        return {"symbols": symbols, "calls": calls, "imports": imports, "edges": edges}
 
     def reindex_file(
         self,
@@ -1715,6 +2046,7 @@ class TreeSitterIndexer:
         self.store.delete_symbols_for_file(repo_name, rel_path)
         self.store.delete_calls_for_file(repo_name, rel_path)
         self.store.delete_imports_for_file(repo_name, rel_path)
+        self.store.delete_edges_for_file(repo_name, rel_path)
 
         # Re-parse
         file_data = self.index_file(repo_name, file_path, rel_path, strategy, lang_name)
@@ -1726,11 +2058,14 @@ class TreeSitterIndexer:
             call.repo_module = repo_module
         for imp in file_data["imports"]:
             imp.repo_module = repo_module
+        for edge in file_data.get("edges", []):
+            edge.repo_module = repo_module
 
         # Insert new data
         self.store.insert_symbols(file_data["symbols"])
         self.store.insert_calls(file_data["calls"])
         self.store.insert_imports(file_data["imports"])
+        self.store.insert_edges(file_data.get("edges", []))
 
         # Update file entry
         self.store.upsert_file_entry(FileEntry(

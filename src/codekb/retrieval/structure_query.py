@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from codekb.storage.sqlite_store import SqliteStore, Symbol, CallRelation, ImportRecord, FileEntry
+from codekb.storage.sqlite_store import SqliteStore, Symbol, CallRelation, ImportRecord, FileEntry, EdgeRelation
 
 
 class StructureQuery:
@@ -100,6 +100,12 @@ class StructureQuery:
         # Get imports for the symbol's file
         imports = self.store.get_imports(repo_name, primary.file_path, repo_module=repo_module)
 
+        # Get inheritance/interface edges
+        extends_from = self.store.get_edges_from(repo_name, symbol_name, kind="extends", repo_module=repo_module)
+        implements_from = self.store.get_edges_from(repo_name, symbol_name, kind="implements", repo_module=repo_module)
+        extends_to = self.store.get_edges_to(repo_name, symbol_name, kind="extends", repo_module=repo_module)
+        implements_to = self.store.get_edges_to(repo_name, symbol_name, kind="implements", repo_module=repo_module)
+
         return {
             "definition": self._symbol_to_dict(primary),
             "all_definitions": [self._symbol_to_dict(s) for s in symbols],
@@ -114,6 +120,22 @@ class StructureQuery:
             "file_imports": [
                 {"module": i.module, "names": i.imported_names, "line": i.line_number}
                 for i in imports
+            ],
+            "extends": [
+                {"target": e.target_symbol, "file": e.source_file, "line": e.line_number}
+                for e in extends_from
+            ],
+            "implements": [
+                {"target": e.target_symbol, "file": e.source_file, "line": e.line_number}
+                for e in implements_from
+            ],
+            "extended_by": [
+                {"source": e.source_symbol, "file": e.source_file, "line": e.line_number}
+                for e in extends_to
+            ],
+            "implemented_by": [
+                {"source": e.source_symbol, "file": e.source_file, "line": e.line_number}
+                for e in implements_to
             ],
         }
 
