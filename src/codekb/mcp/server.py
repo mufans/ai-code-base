@@ -25,6 +25,18 @@ from codekb.storage.sqlite_store import SqliteStore
 from codekb.storage.vector_store import VectorStore
 
 
+_CODEKB_INSTRUCTIONS = """\
+Use `query_usage` for all "how to use" and "what is X" questions. It automatically follows doc-first priority: README -> API guide -> component guide -> usage examples -> recommendation.
+
+Use `search_code` only when you need to find specific code snippets, definitions, or search by content.
+
+Use `find_symbol` when you know a symbol name but not which repo/module it belongs to. Returns the symbol's repo_name and module so you can call other tools.
+
+Use `list_doc_index` + `read_doc` for reading specific documentation files by path.
+
+Key principle: Documentation first, code second."""
+
+
 def _get_services(config: Optional[CodekbYamlConfig] = None):
     """Instantiate all services."""
     if config is None:
@@ -69,7 +81,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
     """Create and configure the MCP server with all tools and resources."""
     config, settings, store, vector_store, doc_store, repo_manager = _get_services(config)
 
-    server = Server("codekb")
+    server = Server("codekb", instructions=_CODEKB_INSTRUCTIONS)
 
     # Set up retrieval services
     embedding_provider = create_embedding_provider(config, settings, "code_embedding")
@@ -83,6 +95,57 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
         return [
+            # ── Query tools (2 core entry points) ──
+            types.Tool(
+                name="query_usage",
+                description=(
+                    "Query how to use a module, library, or component. "
+                    "Automatically follows doc-first priority: README -> API guide -> component guide -> usage examples -> recommendation. "
+                    "Use this for all 'how to use X', 'what is X', 'X API', 'X usage' questions. "
+                    "Examples: query_usage(repo_name='X', query='QuoteService', module='quote_service') or "
+                    "query_usage(repo_name='X', query='Router', symbol='Router')"
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "query": {"type": "string", "description": "Query content (e.g. 'QuoteService usage', 'how to use Router')"},
+                        "module": {"type": "string", "description": "Optional module name"},
+                        "symbol": {"type": "string", "description": "Optional symbol name (class, function, etc.)"},
+                    },
+                    "required": ["repo_name", "query"],
+                },
+            ),
+            types.Tool(
+                name="find_symbol",
+                description=(
+                    "Find which repository and module a symbol (class, function, etc.) belongs to. "
+                    "Use when you know a symbol name but not its repo_name, e.g. find_symbol(symbol_name='QuoteService'). "
+                    "Returns repo_name, module, file_path, kind, signature for each match across all repos."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": {"type": "string", "description": "Symbol name to search for (exact match)"},
+                    },
+                    "required": ["symbol_name"],
+                },
+            ),
+            types.Tool(
+                name="search_code",
+                description="Semantic code search across repositories. Use for finding specific code, definitions, or searching by content. For usage questions, prefer query_usage.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "repo_name": {"type": "string", "description": "Optional repo filter"},
+                        "module": {"type": "string", "description": "Optional module filter"},
+                        "top_k": {"type": "integer", "description": "Max results", "default": 10},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            # ── Management / metadata tools ──
             types.Tool(
                 name="list_repos",
                 description="List all indexed repositories",
@@ -99,7 +162,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
             ),
             types.Tool(
                 name="list_modules",
-                description="List all modules in a repository (for monorepo/multi-package support)",
+                description="List all modules in a repository (for monorepo/multi-package support).",
                 inputSchema={
                     "type": "object",
                     "properties": {"repo_name": {"type": "string"}},
@@ -116,22 +179,8 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 },
             ),
             types.Tool(
-                name="search_code",
-                description="Semantic code search across repositories",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "repo_name": {"type": "string", "description": "Optional repo filter"},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                        "top_k": {"type": "integer", "description": "Max results", "default": 10},
-                    },
-                    "required": ["query"],
-                },
-            ),
-            types.Tool(
                 name="get_structure",
-                description="Get code structure (classes, functions, signatures)",
+                description="Get code structure (classes, functions, signatures).",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -144,7 +193,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
             ),
             types.Tool(
                 name="get_symbol_detail",
-                description="Get full symbol definition, references, and call graph",
+                description="Get full symbol definition, references, and call graph.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -157,7 +206,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
             ),
             types.Tool(
                 name="get_file_content",
-                description="Read file content from a repository",
+                description="Read file content from a repository.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -170,15 +219,6 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 },
             ),
             types.Tool(
-                name="get_readme",
-                description="Get README content from a repository",
-                inputSchema={
-                    "type": "object",
-                    "properties": {"repo_name": {"type": "string"}},
-                    "required": ["repo_name"],
-                },
-            ),
-            types.Tool(
                 name="get_architecture",
                 description="Get generated architecture document for a repository",
                 inputSchema={
@@ -188,33 +228,6 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                         "module": {"type": "string", "description": "Optional module filter"},
                     },
                     "required": ["repo_name"],
-                },
-            ),
-            types.Tool(
-                name="get_usage_examples",
-                description="Find real usage examples of a library or pattern",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "repo_name": {"type": "string"},
-                        "library_or_pattern": {"type": "string"},
-                        "top_k": {"type": "integer", "default": 5},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                    },
-                    "required": ["repo_name", "library_or_pattern"],
-                },
-            ),
-            types.Tool(
-                name="get_integration_guide",
-                description="Get integration guide for a library in a project",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "repo_name": {"type": "string"},
-                        "library": {"type": "string"},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                    },
-                    "required": ["repo_name", "library"],
                 },
             ),
             types.Tool(
@@ -260,7 +273,7 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
             ),
             types.Tool(
                 name="list_doc_index",
-                description="List document index for a repository (file name, type, size, title). Lightweight metadata only, no content.",
+                description="List document index for a repository (file name, type, size, title). Lightweight metadata only, no content. Use doc_type='readme' to list all module READMEs.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -280,60 +293,6 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                         "file_path": {"type": "string", "description": "Relative file path, e.g. CLAUDE.md or docs/architecture.md"},
                     },
                     "required": ["repo_name", "file_path"],
-                },
-            ),
-            types.Tool(
-                name="get_component_guide",
-                description="Get a component usage guide: properties, methods, usage example, and related symbols. Returns complete guide in one call.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "repo_name": {"type": "string", "description": "Repository name"},
-                        "symbol_name": {"type": "string", "description": "Component/class name"},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                    },
-                    "required": ["repo_name", "symbol_name"],
-                },
-            ),
-            types.Tool(
-                name="get_usage_examples_v2",
-                description="Find real usage examples of a symbol in calling code, excluding its own definition file.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "repo_name": {"type": "string", "description": "Repository name"},
-                        "symbol_name": {"type": "string", "description": "Symbol name to find usages for"},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                        "top_k": {"type": "integer", "description": "Max examples (default 5)", "default": 5},
-                    },
-                    "required": ["repo_name", "symbol_name"],
-                },
-            ),
-            types.Tool(
-                name="recommend_component",
-                description="Recommend components matching a natural language requirement description. Supports Chinese and English.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "repo_name": {"type": "string", "description": "Repository name"},
-                        "requirement": {"type": "string", "description": "Requirement description (Chinese or English)"},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                        "top_k": {"type": "integer", "description": "Max recommendations (default 3)", "default": 3},
-                    },
-                    "required": ["repo_name", "requirement"],
-                },
-            ),
-            types.Tool(
-                name="get_api_guide",
-                description="Get an API/library integration guide with import statements, component list, setup steps, and code example.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "repo_name": {"type": "string", "description": "Repository name"},
-                        "library_name": {"type": "string", "description": "Library or module name"},
-                        "module": {"type": "string", "description": "Optional module filter"},
-                    },
-                    "required": ["repo_name", "library_name"],
                 },
             ),
         ]
@@ -426,6 +385,109 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
     return server
 
 
+async def _handle_query_usage(
+    arguments: dict,
+    store: SqliteStore,
+    doc_store: DocStore,
+    structure_query: StructureQuery,
+    reference_builder: ReferenceBuilder,
+    guide_generator: GuideGenerator,
+    config: CodekbYamlConfig,
+) -> dict:
+    """Handle query_usage: doc-first priority chain."""
+    repo_name = arguments["repo_name"]
+    query = arguments["query"]
+    module = arguments.get("module")
+    symbol = arguments.get("symbol")
+
+    llm_client = _create_llm_client_dict(config, load_settings())
+
+    # Step 1: Try README (module-level if module provided, else repo-level)
+    readme_content = structure_query.get_readme(repo_name, module=module or query)
+    if readme_content:
+        return {
+            "source": "readme",
+            "content": {"content": readme_content},
+            "query": query,
+            "repo_name": repo_name,
+            "module": module,
+        }
+
+    # Step 2: Try API guide
+    api_result = await guide_generator.get_api_guide(
+        repo_name,
+        query,
+        module=module,
+        llm_client=llm_client,
+    )
+    if api_result and not (isinstance(api_result, dict) and api_result.get("error")):
+        return {
+            "source": "api_guide",
+            "content": api_result,
+            "query": query,
+            "repo_name": repo_name,
+            "module": module,
+        }
+
+    # Step 3: If symbol provided, try component guide then usage examples
+    if symbol:
+        comp_result = await guide_generator.get_component_guide(
+            repo_name,
+            symbol,
+            module=module,
+            llm_client=llm_client,
+        )
+        if comp_result and not (isinstance(comp_result, dict) and comp_result.get("error")):
+            return {
+                "source": "component_guide",
+                "content": comp_result,
+                "query": query,
+                "repo_name": repo_name,
+                "module": module,
+            }
+
+        usage_result = await guide_generator.get_usage_examples(
+            repo_name,
+            symbol,
+            module=module,
+            top_k=5,
+            llm_client=llm_client,
+        )
+        if usage_result and not (isinstance(usage_result, dict) and usage_result.get("error")):
+            return {
+                "source": "usage_examples",
+                "content": usage_result,
+                "query": query,
+                "repo_name": repo_name,
+                "module": module,
+            }
+
+    # Step 4: Fallback to recommend_component
+    rec_result = await guide_generator.recommend_component(
+        repo_name,
+        query,
+        module=module,
+        top_k=3,
+        llm_client=llm_client,
+    )
+    if rec_result and not (isinstance(rec_result, dict) and rec_result.get("error")):
+        return {
+            "source": "recommend",
+            "content": rec_result,
+            "query": query,
+            "repo_name": repo_name,
+            "module": module,
+        }
+
+    return {
+        "source": "none",
+        "content": {"error": f"No documentation or usage info found for '{query}' in {repo_name}"},
+        "query": query,
+        "repo_name": repo_name,
+        "module": module,
+    }
+
+
 async def _handle_tool(
     name: str,
     arguments: dict,
@@ -439,7 +501,13 @@ async def _handle_tool(
     config: CodekbYamlConfig,
     guide_generator: GuideGenerator,
 ) -> dict | list:
-    if name == "list_repos":
+    if name == "query_usage":
+        return await _handle_query_usage(
+            arguments, store, doc_store, structure_query,
+            reference_builder, guide_generator, config,
+        )
+
+    elif name == "list_repos":
         repos = store.list_repos()
         return [
             {
@@ -477,13 +545,32 @@ async def _handle_tool(
     elif name == "list_modules":
         modules = structure_query.list_modules(arguments["repo_name"])
         modules_data = store.get_repo_modules(arguments["repo_name"])
+        readme_entries = store.get_doc_index(arguments["repo_name"], doc_type="readme")
+        readme_paths = {e["file_path"] for e in readme_entries}
+
+        result_modules = []
+        if modules_data:
+            for mod in modules_data:
+                has_readme = any(rp for rp in readme_paths if rp.startswith(mod.get("path", "") + "/") or rp == mod.get("path", ""))
+                entry = {**mod, "has_readme": has_readme}
+                result_modules.append(entry)
+        else:
+            result_modules = [{"name": m, "has_readme": False} for m in modules]
+
         return {
-            "modules": modules_data if modules_data else [{"name": m} for m in modules],
+            "modules": result_modules,
             "is_monorepo": len(modules) > 0,
         }
 
     elif name == "get_module_dependencies":
         return structure_query.get_module_dependencies(arguments["repo_name"])
+
+    elif name == "find_symbol":
+        results = structure_query.find_symbol(arguments["symbol_name"])
+        return {
+            "results": results,
+            "total": len(results),
+        }
 
     elif name == "search_code":
         query = arguments["query"]
@@ -542,8 +629,16 @@ async def _handle_tool(
         return result or {"error": "File not found"}
 
     elif name == "get_readme":
-        content = structure_query.get_readme(arguments["repo_name"])
-        return {"content": content} if content else {"error": "README not found"}
+        content = structure_query.get_readme(
+            arguments["repo_name"],
+            module=arguments.get("module"),
+        )
+        if content:
+            result = {"content": content}
+            if arguments.get("module"):
+                result["module"] = arguments["module"]
+            return result
+        return {"error": "README not found"}
 
     elif name == "get_architecture":
         repo_module = arguments.get("module", "")
