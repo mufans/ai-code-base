@@ -276,6 +276,69 @@ class TestSqliteStore:
         results = sqlite_store.find_symbol_across_repos("NonExistent")
         assert results == []
 
+    def test_find_symbol_cross_repo_via_structure_query(self, sqlite_store):
+        """Test StructureQuery.find_symbol delegates correctly."""
+        from codekb.retrieval.structure_query import StructureQuery
+        sqlite_store.insert_symbols([
+            Symbol(repo_name="repo-a", file_path="svc.py", name="QuoteService",
+                   kind="class", signature="class QuoteService:",
+                   start_line=1, end_line=10, language="python",
+                   repo_module="quote_service"),
+        ])
+        sq = StructureQuery(sqlite_store)
+        results = sq.find_symbol("QuoteService")
+        assert len(results) == 1
+        assert results[0]["repo_name"] == "repo-a"
+        assert results[0]["module"] == "quote_service"
+        assert results[0]["kind"] == "class"
+
+    def test_resolve_symbol_unique_match(self, sqlite_store):
+        """Test resolve_symbol with unique match returns (repo_name, module)."""
+        from codekb.retrieval.structure_query import StructureQuery
+        sqlite_store.insert_symbols([
+            Symbol(repo_name="repo-a", file_path="svc.py", name="QuoteService",
+                   kind="class", start_line=1, end_line=10, language="python",
+                   repo_module="quote_service"),
+        ])
+        sq = StructureQuery(sqlite_store)
+        result = sq.resolve_symbol("QuoteService")
+        assert result == ("repo-a", "quote_service")
+
+    def test_resolve_symbol_no_match(self, sqlite_store):
+        """Test resolve_symbol with no match returns None."""
+        from codekb.retrieval.structure_query import StructureQuery
+        sq = StructureQuery(sqlite_store)
+        result = sq.resolve_symbol("NonExistent")
+        assert result is None
+
+    def test_resolve_symbol_multiple_repos(self, sqlite_store):
+        """Test resolve_symbol with matches in multiple repos returns None."""
+        from codekb.retrieval.structure_query import StructureQuery
+        sqlite_store.insert_symbols([
+            Symbol(repo_name="repo-a", file_path="a.py", name="Foo",
+                   kind="class", start_line=1, end_line=5, language="python"),
+            Symbol(repo_name="repo-b", file_path="b.py", name="Foo",
+                   kind="class", start_line=1, end_line=5, language="python"),
+        ])
+        sq = StructureQuery(sqlite_store)
+        result = sq.resolve_symbol("Foo")
+        assert result is None
+
+    def test_resolve_symbol_same_repo_different_modules(self, sqlite_store):
+        """Test resolve_symbol with same repo but different modules returns first match."""
+        from codekb.retrieval.structure_query import StructureQuery
+        sqlite_store.insert_symbols([
+            Symbol(repo_name="repo-a", file_path="a.py", name="Foo",
+                   kind="class", start_line=1, end_line=5, language="python",
+                   repo_module="mod_a"),
+            Symbol(repo_name="repo-a", file_path="b.py", name="Foo",
+                   kind="class", start_line=1, end_line=5, language="python",
+                   repo_module="mod_b"),
+        ])
+        sq = StructureQuery(sqlite_store)
+        result = sq.resolve_symbol("Foo")
+        assert result == ("repo-a", "mod_a")
+
 
 class TestDocIndex:
     def test_index_docs(self, sqlite_store, tmp_path):

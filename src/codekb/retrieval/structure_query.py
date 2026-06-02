@@ -35,7 +35,9 @@ class StructureQuery:
         for sym in symbols:
             if sym.file_path not in result:
                 result[sym.file_path] = []
-            result[sym.file_path].append(self._symbol_to_dict(sym))
+            result[sym.file_path].append(
+                self._symbol_to_dict(sym, include_file=False, include_module=False)
+            )
 
         return [{"file": fp, "symbols": syms} for fp, syms in sorted(result.items())]
 
@@ -107,8 +109,8 @@ class StructureQuery:
         ext = Path(file_path).suffix.lower()
         lang_map = {
             ".py": "python", ".js": "javascript", ".ts": "typescript",
-            ".java": "java", ".go": "go", ".rs": "rust", ".rb": "ruby",
-            ".php": "php", ".c": "c", ".cpp": "cpp", ".cs": "csharp",
+            ".ets": "typescript", ".java": "java", ".go": "go", ".rs": "rust",
+            ".rb": "ruby", ".php": "php", ".c": "c", ".cpp": "cpp", ".cs": "csharp",
         }
 
         return {
@@ -118,17 +120,38 @@ class StructureQuery:
             "total_lines": len(lines),
         }
 
-    def get_readme(self, repo_name: str) -> Optional[str]:
-        """Get README content from the repo."""
+    def get_readme(self, repo_name: str, module: Optional[str] = None) -> Optional[str]:
+        """Get README content from the repo, optionally for a specific module."""
         repo = self.store.get_repo(repo_name)
         if repo is None:
             return None
 
         repo_path = Path(repo.local_path)
+
+        # Module-level README: resolve module path and look for README
+        if module:
+            module_path = self._resolve_module_path(repo_name, module)
+            if module_path:
+                module_dir = repo_path / module_path
+                for name in ["README.md", "README.rst", "README.txt", "README"]:
+                    readme = module_dir / name
+                    if readme.exists():
+                        return readme.read_text(encoding="utf-8", errors="replace")
+            return None
+
+        # Root README (default behavior)
         for name in ["README.md", "README.rst", "README.txt", "README"]:
             readme = repo_path / name
             if readme.exists():
                 return readme.read_text(encoding="utf-8", errors="replace")
+        return None
+
+    def _resolve_module_path(self, repo_name: str, module: str) -> Optional[str]:
+        """Resolve module name to its filesystem path using repo modules data."""
+        modules_data = self.store.get_repo_modules(repo_name)
+        for mod in modules_data:
+            if mod["name"] == module:
+                return mod.get("path", "")
         return None
 
     def get_file_tree(self, repo_name: str, repo_module: Optional[str] = None) -> list[dict]:
@@ -171,6 +194,39 @@ class StructureQuery:
         """List all modules in a repo."""
         return self.store.list_modules(repo_name)
 
+    def find_symbol(self, symbol_name: str) -> list[dict]:
+        """Find symbol across all repos, returning归属 and basic info."""
+        symbols = self.store.find_symbol_across_repos(symbol_name)
+        return [
+            {
+                "repo_name": s.repo_name,
+                "module": s.repo_module,
+                "file_path": s.file_path,
+                "name": s.name,
+                "kind": s.kind,
+                "signature": s.signature,
+                "line": s.start_line,
+                "end_line": s.end_line,
+                "docstring": s.docstring,
+            }
+            for s in symbols
+        ]
+
+    def resolve_symbol(self, name: str) -> Optional[tuple[str, Optional[str]]]:
+        """Resolve a symbol name to (repo_name, module).
+
+        Returns None if zero or multiple repos match.
+        If multiple symbols exist within the same repo, returns first match.
+        """
+        symbols = self.store.find_symbol_across_repos(name)
+        if not symbols:
+            return None
+        repos = {s.repo_name for s in symbols}
+        if len(repos) > 1:
+            return None
+        first = symbols[0]
+        return (first.repo_name, first.repo_module or None)
+
     def get_module_dependencies(self, repo_name: str) -> list[dict]:
         """Analyze cross-module dependencies based on import statements.
 
@@ -206,15 +262,20 @@ class StructureQuery:
             for (src, dst), files in sorted(deps.items())
         ]
 
-    def _symbol_to_dict(self, sym: Symbol) -> dict:
-        return {
+    def _symbol_to_dict(self, sym: Symbol, include_file: bool = True,
+                        include_module: bool = True) -> dict:
+        d: dict = {
             "name": sym.name,
             "type": sym.kind,
             "signature": sym.signature,
-            "file": sym.file_path,
             "line": sym.start_line,
             "end_line": sym.end_line,
             "parent": sym.parent,
-            "docstring": sym.docstring,
-            "repo_module": sym.repo_module,
         }
+        if include_file:
+            d["file"] = sym.file_path
+        if include_module:
+            d["repo_module"] = sym.repo_module
+        if sym.docstring:
+            d["docstring"] = sym.docstring
+        return d
