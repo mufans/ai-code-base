@@ -429,3 +429,46 @@ def webhook(
     app = create_webhook_app(orchestrator, webhook_secret=None)
     console.print(f"Starting webhook receiver on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+@app.command()
+def watch(
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="Watch specific repo only"),
+):
+    """Watch for file changes and trigger incremental re-indexing.
+
+    Uses watchdog library with 2000ms debounce and content_hash change detection.
+    Watches all indexed repos by default, or a specific repo with --repo.
+    """
+    from codekb.watcher.file_watcher import FileWatcher
+
+    config = load_config()
+
+    # If watching a specific repo, verify it exists
+    if repo:
+        data_dir = ensure_data_dir(config)
+        store = SqliteStore(data_dir / "index")
+        repo_record = store.get_repo(repo)
+        if repo_record is None:
+            error_console.print(f"[red]Repo not found: {repo}[/red]")
+            raise typer.Exit(code=1)
+        if repo_record.status != "indexed":
+            error_console.print(f"[red]Repo '{repo}' is not indexed (status: {repo_record.status})[/red]")
+            raise typer.Exit(code=1)
+
+    watcher = FileWatcher(config)
+    repos = watcher.store.list_repos()
+    indexed = [r for r in repos if r.status == "indexed"]
+    if repo:
+        indexed = [r for r in indexed if r.name == repo]
+
+    if not indexed:
+        error_console.print("[red]No indexed repos to watch. Run 'codekb sync' first.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(f"Watching [bold]{len(indexed)}[/bold] repo(s) for changes...")
+    for r in indexed:
+        console.print(f"  {r.name} ({r.local_path})")
+    console.print("Press Ctrl+C to stop.")
+
+    watcher.watch_forever()
