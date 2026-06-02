@@ -108,12 +108,12 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "repo_name": {"type": "string", "description": "Repository name"},
+                        "repo_name": {"type": "string", "description": "Repository name (optional — auto-resolved if omitted)"},
                         "query": {"type": "string", "description": "Query content (e.g. 'QuoteService usage', 'how to use Router')"},
                         "module": {"type": "string", "description": "Optional module name"},
                         "symbol": {"type": "string", "description": "Optional symbol name (class, function, etc.)"},
                     },
-                    "required": ["repo_name", "query"],
+                    "required": ["query"],
                 },
             ),
             types.Tool(
@@ -184,11 +184,11 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "repo_name": {"type": "string"},
+                        "repo_name": {"type": "string", "description": "Repository name (optional — auto-resolved if omitted)"},
                         "path": {"type": "string", "description": "Optional file path filter"},
                         "module": {"type": "string", "description": "Optional module filter"},
                     },
-                    "required": ["repo_name"],
+                    "required": [],
                 },
             ),
             types.Tool(
@@ -197,11 +197,11 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "repo_name": {"type": "string"},
+                        "repo_name": {"type": "string", "description": "Repository name (optional — auto-resolved if omitted)"},
                         "symbol_name": {"type": "string"},
                         "module": {"type": "string", "description": "Optional module filter"},
                     },
-                    "required": ["repo_name", "symbol_name"],
+                    "required": ["symbol_name"],
                 },
             ),
             types.Tool(
@@ -385,6 +385,28 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
     return server
 
 
+def _resolve_repo(structure_query: StructureQuery, symbol_name: str) -> dict:
+    """Try to auto-resolve a symbol to a repo_name.
+
+    Returns {"repo_name": str, "module_hint": Optional[str]} on success,
+    or {"error": str} / {"error": str, "candidates": list} on failure.
+    """
+    resolved = structure_query.resolve_symbol(symbol_name)
+    if resolved is None:
+        results = structure_query.find_symbol(symbol_name)
+        if not results:
+            return {"error": f"Symbol '{symbol_name}' not found in any repository. Use list_repos to see available repos."}
+        candidates = [
+            {"repo_name": r["repo_name"], "module": r["module"]}
+            for r in results
+        ]
+        return {
+            "error": f"Symbol '{symbol_name}' found in multiple repos. Please specify repo_name.",
+            "candidates": candidates,
+        }
+    return {"repo_name": resolved[0], "module_hint": resolved[1]}
+
+
 async def _handle_query_usage(
     arguments: dict,
     store: SqliteStore,
@@ -395,10 +417,20 @@ async def _handle_query_usage(
     config: CodekbYamlConfig,
 ) -> dict:
     """Handle query_usage: doc-first priority chain."""
-    repo_name = arguments["repo_name"]
+    repo_name = arguments.get("repo_name")
     query = arguments["query"]
     module = arguments.get("module")
     symbol = arguments.get("symbol")
+
+    # Auto-resolve repo_name if not provided
+    if not repo_name:
+        lookup_name = symbol or query
+        resolved = _resolve_repo(structure_query, lookup_name)
+        if "error" in resolved:
+            return resolved
+        repo_name = resolved["repo_name"]
+        if not module and resolved.get("module_hint"):
+            module = resolved["module_hint"]
 
     llm_client = _create_llm_client_dict(config, load_settings())
 
@@ -595,8 +627,14 @@ async def _handle_tool(
         ]
 
     elif name == "get_structure":
+        repo_name = arguments.get("repo_name")
+        if not repo_name:
+            resolved = _resolve_repo(structure_query, arguments.get("path", ""))
+            if "error" in resolved:
+                return resolved
+            repo_name = resolved["repo_name"]
         result = structure_query.get_structure(
-            arguments["repo_name"],
+            repo_name,
             path=arguments.get("path"),
             repo_module=arguments.get("module"),
         )
@@ -613,8 +651,14 @@ async def _handle_tool(
         return result
 
     elif name == "get_symbol_detail":
+        repo_name = arguments.get("repo_name")
+        if not repo_name:
+            resolved = _resolve_repo(structure_query, arguments["symbol_name"])
+            if "error" in resolved:
+                return resolved
+            repo_name = resolved["repo_name"]
         return structure_query.get_symbol_detail(
-            arguments["repo_name"],
+            repo_name,
             arguments["symbol_name"],
             repo_module=arguments.get("module"),
         ) or {"error": "Symbol not found"}
