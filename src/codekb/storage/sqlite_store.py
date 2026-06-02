@@ -45,6 +45,7 @@ class Symbol(BaseModel):
     language: str = ""
     source: str = ""  # the actual source code of the symbol
     repo_module: str = ""
+    is_exported: bool = False
 
 
 class CallRelation(BaseModel):
@@ -168,7 +169,8 @@ class SqliteStore:
                 parent TEXT DEFAULT '',
                 language TEXT DEFAULT '',
                 source TEXT DEFAULT '',
-                repo_module TEXT NOT NULL DEFAULT ''
+                repo_module TEXT NOT NULL DEFAULT '',
+                is_exported INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS calls (
@@ -219,6 +221,7 @@ class SqliteStore:
 
         # Migrate existing databases
         self._migrate_add_repo_module()
+        self._migrate_add_is_exported()
 
     # --- Repo operations ---
 
@@ -307,16 +310,18 @@ class SqliteStore:
         conn = self._connect(self._struct_path)
         conn.executemany(
             """INSERT INTO symbols (repo_name, file_path, name, kind, signature, docstring,
-               start_line, end_line, parent, language, source, repo_module)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               start_line, end_line, parent, language, source, repo_module, is_exported)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [(s.repo_name, s.file_path, s.name, s.kind, s.signature, s.docstring,
-              s.start_line, s.end_line, s.parent, s.language, s.source, s.repo_module) for s in symbols],
+              s.start_line, s.end_line, s.parent, s.language, s.source, s.repo_module,
+              int(s.is_exported)) for s in symbols],
         )
         conn.commit()
         conn.close()
 
     def get_symbols(self, repo_name: str, file_path: Optional[str] = None,
-                    repo_module: Optional[str] = None) -> list[Symbol]:
+                    repo_module: Optional[str] = None,
+                    exported_only: bool = False) -> list[Symbol]:
         conn = self._connect(self._struct_path)
         query = "SELECT * FROM symbols WHERE repo_name = ?"
         params: list = [repo_name]
@@ -335,6 +340,8 @@ class SqliteStore:
         if repo_module is not None:
             query += " AND repo_module = ?"
             params.append(repo_module)
+        if exported_only:
+            query += " AND is_exported = 1"
 
         query += " ORDER BY file_path, start_line"
         rows = conn.execute(query, params).fetchall()
@@ -673,6 +680,31 @@ class SqliteStore:
             conn.commit()
             conn.close()
 
+    def _migrate_add_is_exported(self):
+        """Add is_exported column to symbols table (idempotent)."""
+        conn = self._connect(self._struct_path)
+        try:
+            conn.execute("ALTER TABLE symbols ADD COLUMN is_exported INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        conn.commit()
+        conn.close()
+
+    def mark_symbols_exported(self, repo_name: str, updates: list[tuple[str, str]]):
+        """Batch mark symbols as exported.
+
+        updates: list of (file_path, symbol_name) tuples.
+        """
+        if not updates:
+            return
+        conn = self._connect(self._struct_path)
+        conn.executemany(
+            "UPDATE symbols SET is_exported = 1 WHERE repo_name = ? AND file_path = ? AND name = ?",
+            [(repo_name, fp, name) for fp, name in updates],
+        )
+        conn.commit()
+        conn.close()
+
     # --- Guide cache operations ---
 
     def get_guide_cache(self, repo_name: str, tool_type: str, query_key: str,
@@ -743,3 +775,28 @@ class SqliteStore:
             return json.loads(row["modules_json"])
         except (json.JSONDecodeError, TypeError):
             return []
+
+    def find_module_across_repos(self, name: str) -> list[dict]:
+        """Find a module by exact name across all repos."""
+        conn = self._connect(self._meta_path)
+        rows = conn.execute(
+            "SELECT name, modules_json FROM repos WHERE modules_json IS NOT NULL AND modules_json != '[]'",
+        ).fetchall()
+        conn.close()
+
+        results = []
+        for row in rows:
+            repo_name = row["name"]
+            try:
+                modules = json.loads(row["modules_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for mod in modules:
+                if mod.get("name") == name:
+                    results.append({
+                        "repo_name": repo_name,
+                        "module_name": mod["name"],
+                        "module_path": mod.get("path", ""),
+                        "language": mod.get("language", ""),
+                    })
+        return results

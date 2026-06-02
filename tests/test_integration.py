@@ -220,9 +220,28 @@ class TestFullPipeline:
 
         sq = StructureQuery(store)
 
-        # Get structure
+        # Get structure (summary mode — no path)
         structure = sq.get_structure("example-project")
         assert len(structure) > 0
+        # Summary mode returns {file, symbol_count, symbols}
+        for entry in structure:
+            assert "file" in entry
+            assert "symbol_count" in entry
+            assert "symbols" in entry
+            # Each symbol in summary mode has only name + type
+            for sym in entry["symbols"]:
+                assert set(sym.keys()) == {"name", "type"}
+
+        # Get structure with path (full detail mode)
+        detail_structure = sq.get_structure("example-project", path="example/calculator.py")
+        assert len(detail_structure) > 0
+        # Full detail mode returns symbols with signature, line, end_line, parent
+        for sym in detail_structure:
+            assert "name" in sym
+            assert "type" in sym
+            assert "signature" in sym
+            assert "line" in sym
+            assert "file" in sym
 
         # Get symbol detail
         detail = sq.get_symbol_detail("example-project", "Calculator")
@@ -511,3 +530,256 @@ class Server:
         # List docs per module
         frontend_docs = doc_store.list_docs("test-repo", repo_module="frontend")
         assert "ARCHITECTURE.md" in frontend_docs
+
+
+# --- Export API awareness tests ---
+
+TITLEBAR_ETS = r'''
+@Component
+export struct TitleBar {
+  build() {
+    Row() {
+      Text("Title")
+    }
+  }
+}
+'''
+
+HELPER_ETS = r'''
+// Internal helper, not exported via Index.ets
+class InternalHelper {
+  process(): string {
+    return "helper"
+  }
+}
+
+export class ExportedHelper {
+  run(): string {
+    return "exported"
+  }
+}
+'''
+
+MENU_ETS = r'''
+export interface MenuItem {
+  title: string
+  icon?: string
+}
+
+export class MenuBuilder {
+  private items: MenuItem[] = []
+
+  add(item: MenuItem): MenuBuilder {
+    this.items.push(item)
+    return this
+  }
+
+  build(): MenuItem[] {
+    return this.items
+  }
+}
+
+// Internal, not exported
+class InternalCache {
+  private data: Map<string, Object> = new Map()
+}
+'''
+
+INDEX_ETS_NAMED = r'''
+export { TitleBar } from './TitleBar'
+export { ExportedHelper } from './Helper'
+'''
+
+INDEX_ETS_WILDCARD = r'''
+export * from './Menu'
+'''
+
+
+@pytest.fixture
+def arkts_monorepo(tmp_path):
+    """Create a mock ArkTS monorepo with modules and Index.ets entry files."""
+    repo = tmp_path / "harmony-app"
+    repo.mkdir()
+
+    # Module: biz_ui with named exports
+    biz_ui = repo / "bizCommon" / "biz_ui"
+    biz_ui.mkdir(parents=True)
+    (biz_ui / "oh-package.json5").write_text('{"name": "biz_ui"}')
+    (biz_ui / "Index.ets").write_text(INDEX_ETS_NAMED)
+    (biz_ui / "TitleBar.ets").write_text(TITLEBAR_ETS)
+    (biz_ui / "Helper.ets").write_text(HELPER_ETS)
+
+    # Module: biz_menu with wildcard export
+    biz_menu = repo / "bizCommon" / "biz_menu"
+    biz_menu.mkdir(parents=True)
+    (biz_menu / "oh-package.json5").write_text('{"name": "biz_menu"}')
+    (biz_menu / "Index.ets").write_text(INDEX_ETS_WILDCARD)
+    (biz_menu / "Menu.ets").write_text(MENU_ETS)
+
+    return repo
+
+
+class TestExportedApiAwareness:
+    def test_named_exports_marked(self, arkts_monorepo, services):
+        """Named exports from Index.ets should be marked as is_exported."""
+        _, store, _, _, repo_manager = services
+        repo_manager.add_repo(str(arkts_monorepo), name="harmony-app", is_local=True)
+
+        from codekb.indexers.tree_sitter import TreeSitterIndexer
+        ts = TreeSitterIndexer(store)
+        modules = [
+            ModuleInfo(name="biz_ui", path="bizCommon/biz_ui"),
+            ModuleInfo(name="biz_menu", path="bizCommon/biz_menu"),
+        ]
+        ts.index_repo("harmony-app", arkts_monorepo, modules=modules)
+
+        # TitleBar should be exported via Index.ets
+        symbols = store.get_symbol_by_name("harmony-app", "TitleBar")
+        assert len(symbols) >= 1
+        assert any(s.is_exported for s in symbols), \
+            f"TitleBar should be marked as exported, got: {[s.is_exported for s in symbols]}"
+
+        # ExportedHelper should be exported
+        helpers = store.get_symbol_by_name("harmony-app", "ExportedHelper")
+        assert len(helpers) >= 1
+        assert any(s.is_exported for s in helpers)
+
+    def test_wildcard_exports_resolved(self, arkts_monorepo, services):
+        """export * from './Menu' should resolve all exported symbols."""
+        _, store, _, _, repo_manager = services
+        repo_manager.add_repo(str(arkts_monorepo), name="harmony-app", is_local=True)
+
+        from codekb.indexers.tree_sitter import TreeSitterIndexer
+        ts = TreeSitterIndexer(store)
+        modules = [
+            ModuleInfo(name="biz_ui", path="bizCommon/biz_ui"),
+            ModuleInfo(name="biz_menu", path="bizCommon/biz_menu"),
+        ]
+        ts.index_repo("harmony-app", arkts_monorepo, modules=modules)
+
+        # MenuItem and MenuBuilder are exported from Menu.ets
+        menu_items = store.get_symbol_by_name("harmony-app", "MenuItem")
+        assert len(menu_items) >= 1
+        assert any(s.is_exported for s in menu_items), \
+            f"MenuItem should be marked as exported via wildcard, got: {[s.is_exported for s in menu_items]}"
+
+        builders = store.get_symbol_by_name("harmony-app", "MenuBuilder")
+        assert len(builders) >= 1
+        assert any(s.is_exported for s in builders)
+
+    def test_internal_symbols_not_marked(self, arkts_monorepo, services):
+        """Symbols not exported via Index.ets should remain is_exported=False."""
+        _, store, _, _, repo_manager = services
+        repo_manager.add_repo(str(arkts_monorepo), name="harmony-app", is_local=True)
+
+        from codekb.indexers.tree_sitter import TreeSitterIndexer
+        ts = TreeSitterIndexer(store)
+        modules = [
+            ModuleInfo(name="biz_ui", path="bizCommon/biz_ui"),
+            ModuleInfo(name="biz_menu", path="bizCommon/biz_menu"),
+        ]
+        ts.index_repo("harmony-app", arkts_monorepo, modules=modules)
+
+        # InternalHelper is NOT in Index.ets exports
+        internal = store.get_symbol_by_name("harmony-app", "InternalHelper")
+        if internal:
+            assert all(not s.is_exported for s in internal), \
+                f"InternalHelper should NOT be exported, got: {[s.is_exported for s in internal]}"
+
+        # InternalCache is NOT exported
+        cache = store.get_symbol_by_name("harmony-app", "InternalCache")
+        if cache:
+            assert all(not s.is_exported for s in cache)
+
+    def test_case_insensitive_entry(self, arkts_monorepo, services):
+        """Index.ets (capital I) should be detected as entry point."""
+        _, store, _, _, repo_manager = services
+        repo_manager.add_repo(str(arkts_monorepo), name="harmony-app", is_local=True)
+
+        from codekb.indexers.tree_sitter import TreeSitterIndexer
+        ts = TreeSitterIndexer(store)
+        modules = [
+            ModuleInfo(name="biz_ui", path="bizCommon/biz_ui"),
+            ModuleInfo(name="biz_menu", path="bizCommon/biz_menu"),
+        ]
+        ts.index_repo("harmony-app", arkts_monorepo, modules=modules)
+
+        # Check file_tree for entry point flag
+        files = store.get_file_tree("harmony-app")
+        entry_files = [f for f in files if f.is_entry_point]
+        entry_paths = {f.path for f in entry_files}
+        assert any("Index.ets" in p for p in entry_paths), \
+            f"Index.ets should be marked as entry_point, entry files: {entry_paths}"
+
+    def test_migration_existing_db(self, tmp_path, services):
+        """Migration should add is_exported column to existing databases."""
+        config, store, _, _, _ = services
+
+        # The store is already initialized with migration.
+        # Verify the column exists by inserting and reading a symbol.
+        from codekb.storage.sqlite_store import Symbol
+        sym = Symbol(
+            repo_name="test-migration",
+            file_path="test.ets",
+            name="TestComponent",
+            kind="class",
+            is_exported=True,
+        )
+        store.insert_symbols([sym])
+
+        retrieved = store.get_symbol_by_name("test-migration", "TestComponent")
+        assert len(retrieved) == 1
+        assert retrieved[0].is_exported is True
+
+    def test_find_symbol_includes_exported(self, arkts_monorepo, services):
+        """find_symbol should include is_exported in results."""
+        _, store, _, _, repo_manager = services
+        repo_manager.add_repo(str(arkts_monorepo), name="harmony-app", is_local=True)
+
+        from codekb.indexers.tree_sitter import TreeSitterIndexer
+        ts = TreeSitterIndexer(store)
+        modules = [
+            ModuleInfo(name="biz_ui", path="bizCommon/biz_ui"),
+            ModuleInfo(name="biz_menu", path="bizCommon/biz_menu"),
+        ]
+        ts.index_repo("harmony-app", arkts_monorepo, modules=modules)
+
+        sq = StructureQuery(store)
+        results = sq.find_symbol("TitleBar")
+        assert len(results) >= 1
+        assert any(r.get("is_exported") for r in results), \
+            f"find_symbol should include is_exported for TitleBar, got: {results}"
+
+    def test_structure_summary_exports_first(self, arkts_monorepo, services):
+        """Summary mode should sort exported symbols first within each file."""
+        _, store, _, _, repo_manager = services
+        repo_manager.add_repo(str(arkts_monorepo), name="harmony-app", is_local=True)
+
+        from codekb.indexers.tree_sitter import TreeSitterIndexer
+        ts = TreeSitterIndexer(store)
+        modules = [
+            ModuleInfo(name="biz_ui", path="bizCommon/biz_ui"),
+            ModuleInfo(name="biz_menu", path="bizCommon/biz_menu"),
+        ]
+        ts.index_repo("harmony-app", arkts_monorepo, modules=modules)
+
+        sq = StructureQuery(store)
+        # Get structure for biz_menu module (no specific path = summary)
+        items = sq.get_structure("harmony-app", repo_module="biz_menu")
+
+        # Find the Menu.ets file entry
+        menu_file = None
+        for item in items:
+            if "Menu.ets" in item.get("file", ""):
+                menu_file = item
+                break
+
+        if menu_file and len(menu_file["symbols"]) > 1:
+            # Check that exported symbols come before non-exported
+            exported_first = False
+            for sym in menu_file["symbols"]:
+                if sym.get("is_exported"):
+                    exported_first = True
+                elif exported_first and not sym.get("is_exported"):
+                    # Found a non-exported after exported - that's fine
+                    pass

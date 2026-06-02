@@ -21,6 +21,7 @@ EXTENSION_MAP: dict[str, str] = {
     ".ts": "typescript",
     ".jsx": "javascript",
     ".tsx": "typescript",
+    ".ets": "typescript",
     ".java": "java",
     ".go": "go",
     ".rs": "rust",

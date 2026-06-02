@@ -28,3 +28,9 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code local config
+.claude/
+
+# Agent memory runtime data
+data/

@@ -2,21 +2,48 @@ codekb:
   data_dir: ~/.codekb
 
   llm_providers:
+    openai:
+      provider: openai
+      # api_key read from .env OPENAI_API_KEY
+    anthropic:
+      provider: anthropic
+      # api_key read from .env ANTHROPIC_API_KEY
+    local:
+      provider: ollama
+      base_url: http://localhost:11434
+    azure-openai:
+      provider: azure
+      api_version: "2024-02-01"
+      base_url: https://xxx.openai.azure.com
+      # api_key read from .env AZURE_API_KEY
     deepseek:
       provider: openai
-      base_url: https://api.deepseek.com
-      model: deepseek/deepseek-chat
+      base_url: https://api.deepseek.com/v1
+      model: deepseek-chat
+      # api_key read from .env DEEPSEEK_API_KEY
 
   embedding_providers:
     local:
       provider: sentence-transformers
       model: all-MiniLM-L6-v2
       dimension: 384
+    openai:
+      provider: openai
+      model: text-embedding-3-small
+      dimension: 1536
+    codestral:
+      provider: openai
+      model: codestral-embed
+      base_url: https://embed.mistral.ai/v1
+      dimension: 1024
 
   assignments:
     doc_generation: deepseek
     code_embedding: local
     doc_embedding: local
+
+  webhook:
+    port: 8080
 
   index:
     chunk_size: 512

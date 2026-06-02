@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,6 +11,8 @@ from typing import Optional
 from codekb.core.config import CodekbYamlConfig
 from codekb.storage.doc_store import DocStore
 from codekb.storage.sqlite_store import SqliteStore
+
+logger = logging.getLogger(__name__)
 
 
 class SkillGenerator:
@@ -213,11 +216,12 @@ Output in Markdown format. Use backticks for code references."""
 
         try:
             import litellm
-            provider_config = self.config.llm_providers.get(
-                self.config.assignments.doc_generation, {}
-            )
-            model = "gpt-4o-mini"
-            if provider_config:
+            if isinstance(llm_client, dict):
+                model = llm_client.get("model", "gpt-4o-mini")
+            else:
+                provider_config = self.config.llm_providers.get(
+                    self.config.assignments.doc_generation, {}
+                )
                 model = provider_config.model or "gpt-4o-mini"
 
             # Build kwargs for litellm, using llm_client dict if available
@@ -237,7 +241,8 @@ Output in Markdown format. Use backticks for code references."""
                 content = re.sub(r'^```\w*\n?', '', content)
                 content = re.sub(r'\n?```$', '', content)
             return content.strip()
-        except Exception:
+        except Exception as e:
+            logger.error(f"LLM skill generation failed for {candidate['name']}: {e}")
             return self._generate_skill_template(repo_name, candidate, symbols)
 
     def _get_relevant_symbols(self, pattern_type: str, symbols: list) -> list:

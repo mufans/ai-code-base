@@ -60,15 +60,25 @@ def _create_llm_client(config: CodekbYamlConfig, settings: Settings) -> Optional
         return None
 
     api_key = settings.OPENAI_API_KEY
-    # litellm uses DEEPSEEK_API_KEY env var for deepseek models
-    # but we can pass api_key explicitly
+    model = provider_config.model or "gpt-4o-mini"
+    api_base = provider_config.base_url
+
     import os
-    if "deepseek" in (provider_config.model or "").lower():
+    provider_type = provider_config.provider.lower()
+
+    # Resolve API key based on provider type
+    if provider_type == "openai" and api_base:
+        # OpenAI-compatible provider (deepseek, etc.) with custom base_url
+        if "deepseek" in (model or "").lower() or "deepseek" in (api_base or "").lower():
+            api_key = os.environ.get("DEEPSEEK_API_KEY") or settings.OPENAI_API_KEY
+            # litellm needs openai/ prefix for OpenAI-compatible endpoints
+            model = f"openai/{model}"
+    elif "deepseek" in (model or "").lower():
         api_key = os.environ.get("DEEPSEEK_API_KEY") or settings.OPENAI_API_KEY
 
     return {
-        "model": provider_config.model or "gpt-4o-mini",
-        "api_base": provider_config.base_url,
+        "model": model,
+        "api_base": api_base,
         "api_key": api_key,
     }
 
@@ -115,11 +125,17 @@ def sync(
                     result = await orchestrator.full_index(r.name)
                 else:
                     console.print(f"Incremental sync [bold]{r.name}[/bold]...")
-                    changed = repo_manager.fetch_updates(r.name) or []
-                    if not changed:
+                    changed = repo_manager.fetch_updates(r.name)
+
+                    # If repo has never been indexed, fallback to full index
+                    if changed is None or (not changed and not store.get_index_status(r.name)):
+                        console.print(f"  Running full index...")
+                        result = await orchestrator.full_index(r.name)
+                    elif not changed:
                         console.print(f"  [green]Up to date[/green]")
                         continue
-                    result = await orchestrator.incremental_index(r.name, changed)
+                    else:
+                        result = await orchestrator.incremental_index(r.name, changed)
                 console.print(f"  [green]Done[/green]: {result}")
             except Exception as e:
                 error_console.print(f"  [red]Error: {e}[/red]")

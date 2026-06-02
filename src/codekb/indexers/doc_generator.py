@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,8 @@ from codekb.core.config import CodekbYamlConfig, Settings
 from codekb.indexers.embedder import EmbeddingIndexer
 from codekb.storage.doc_store import DocStore
 from codekb.storage.sqlite_store import SqliteStore
+
+logger = logging.getLogger(__name__)
 
 
 # Coverage dimensions assessed from README
@@ -128,8 +131,15 @@ README:
 """
         try:
             import litellm
+            if isinstance(llm_client, dict):
+                model = llm_client.get("model", "gpt-4o-mini")
+            else:
+                provider_config = self.config.llm_providers.get(
+                    self.config.assignments.doc_generation, {}
+                )
+                model = provider_config.model or "gpt-4o-mini"
             kwargs = {
-                "model": "gpt-4o-mini",
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"},
             }
@@ -256,11 +266,12 @@ class DocGenerator:
 
         try:
             import litellm
-            provider_config = self.config.llm_providers.get(
-                self.config.assignments.doc_generation, {}
-            )
-            model = "gpt-4o-mini"
-            if provider_config:
+            if isinstance(llm_client, dict):
+                model = llm_client.get("model", "gpt-4o-mini")
+            else:
+                provider_config = self.config.llm_providers.get(
+                    self.config.assignments.doc_generation, {}
+                )
                 model = provider_config.model or "gpt-4o-mini"
 
             # Build kwargs for litellm, using llm_client dict if available
@@ -281,7 +292,8 @@ class DocGenerator:
                 content = re.sub(r'^```\w*\n?', '', content)
                 content = re.sub(r'\n?```$', '', content)
             return content.strip()
-        except Exception:
+        except Exception as e:
+            logger.error(f"LLM doc generation failed for {dimension}: {e}")
             return self._generate_template(repo_name, dimension, symbol_summary, call_summary)
 
     def _generate_template(

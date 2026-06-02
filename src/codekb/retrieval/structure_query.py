@@ -14,6 +14,19 @@ class StructureQuery:
     def __init__(self, store: SqliteStore):
         self.store = store
 
+    # Soft limit for summary mode to avoid extreme token usage
+    _SUMMARY_FILE_LIMIT = 200
+
+    # Languages that use entry-file exports (Index.ets, index.ts, etc.)
+    _EXPORT_BASED_LANGUAGES = {"typescript", "javascript"}
+
+    def _is_export_based_repo(self, repo_name: str) -> bool:
+        """Check if repo uses export-based module system (TS/ETS/JS)."""
+        repo = self.store.get_repo(repo_name)
+        if repo is None:
+            return False
+        return repo.language.lower() in self._EXPORT_BASED_LANGUAGES
+
     def get_structure(
         self,
         repo_name: str,
@@ -22,24 +35,49 @@ class StructureQuery:
     ) -> list[dict]:
         """Get code structure (classes, functions, signatures).
 
-        Returns a nested structure if no path specified, or flat list for a specific file.
+        Two-level query:
+        - With ``path``: returns full symbol details (flat list).
+        - Without ``path``: returns compact summary grouped by file,
+          each symbol only includes ``{name, type}``.
+          For TS/ETS/JS projects, only exported symbols are returned
+          to avoid flooding results with internal implementation details.
         """
-        symbols = self.store.get_symbols(repo_name, file_path=path, repo_module=repo_module)
-
         if path:
-            # Return flat list for a specific file
+            # Return flat list with full details for a specific file
+            symbols = self.store.get_symbols(repo_name, file_path=path, repo_module=repo_module)
             return [self._symbol_to_dict(s) for s in symbols]
 
-        # Build nested structure grouped by file
-        result: dict[str, list[dict]] = {}
-        for sym in symbols:
-            if sym.file_path not in result:
-                result[sym.file_path] = []
-            result[sym.file_path].append(
-                self._symbol_to_dict(sym, include_file=False, include_module=False)
-            )
+        # Summary mode: for TS/ETS/JS projects, only fetch exported symbols
+        exported_only = self._is_export_based_repo(repo_name)
+        symbols = self.store.get_symbols(
+            repo_name, repo_module=repo_module,
+            exported_only=exported_only,
+        )
 
-        return [{"file": fp, "symbols": syms} for fp, syms in sorted(result.items())]
+        # Compact format grouped by file
+        file_symbols: dict[str, list[dict]] = {}
+        for sym in symbols:
+            if sym.file_path not in file_symbols:
+                file_symbols[sym.file_path] = []
+            file_symbols[sym.file_path].append(self._symbol_to_summary_dict(sym))
+
+        items = [
+            {"file": fp, "symbol_count": len(syms), "symbols": syms}
+            for fp, syms in sorted(file_symbols.items())
+        ]
+
+        # Soft limit: return at most _SUMMARY_FILE_LIMIT files
+        if len(items) > self._SUMMARY_FILE_LIMIT:
+            total = len(items)
+            items = items[: self._SUMMARY_FILE_LIMIT]
+            items.append({
+                "file": f"... and {total - self._SUMMARY_FILE_LIMIT} more files",
+                "symbol_count": 0,
+                "symbols": [],
+                "truncated": True,
+            })
+
+        return items
 
     def get_symbol_detail(
         self,
@@ -196,9 +234,9 @@ class StructureQuery:
 
     def find_symbol(self, symbol_name: str) -> list[dict]:
         """Find symbol across all repos, returning归属 and basic info."""
-        symbols = self.store.find_symbol_across_repos(symbol_name)
-        return [
-            {
+        results = []
+        for s in self.store.find_symbol_across_repos(symbol_name):
+            d: dict = {
                 "repo_name": s.repo_name,
                 "module": s.repo_module,
                 "file_path": s.file_path,
@@ -209,8 +247,10 @@ class StructureQuery:
                 "end_line": s.end_line,
                 "docstring": s.docstring,
             }
-            for s in symbols
-        ]
+            if s.is_exported:
+                d["is_exported"] = True
+            results.append(d)
+        return results
 
     def resolve_symbol(self, name: str) -> Optional[tuple[str, Optional[str]]]:
         """Resolve a symbol name to (repo_name, module).
@@ -226,6 +266,65 @@ class StructureQuery:
             return None
         first = symbols[0]
         return (first.repo_name, first.repo_module or None)
+
+    def resolve_keyword(self, keyword: str) -> dict:
+        """Resolve a keyword across repos, modules, and symbols.
+
+        Returns dict with 'results' list and 'total' count.
+        Each result has 'type' (repo/module/symbol) and 'suggested_tool'.
+        """
+        results = []
+
+        # 1. Repo match
+        repo = self.store.get_repo(keyword)
+        if repo is not None:
+            results.append({
+                "type": "repo",
+                "repo_name": repo.name,
+                "language": repo.language,
+                "status": repo.status,
+                "suggested_tool": "get_repo_info",
+                "suggested_args": {"repo_name": repo.name},
+            })
+
+        # 2. Module match
+        for mod in self.store.find_module_across_repos(keyword):
+            results.append({
+                "type": "module",
+                "repo_name": mod["repo_name"],
+                "module_name": mod["module_name"],
+                "module_path": mod["module_path"],
+                "language": mod["language"],
+                "suggested_tool": "get_structure",
+                "suggested_args": {
+                    "repo_name": mod["repo_name"],
+                    "module": mod["module_name"],
+                },
+            })
+
+        # 3. Symbol match
+        for s in self.store.find_symbol_across_repos(keyword):
+            d: dict = {
+                "type": "symbol",
+                "repo_name": s.repo_name,
+                "module": s.repo_module or None,
+                "file_path": s.file_path,
+                "name": s.name,
+                "kind": s.kind,
+                "signature": s.signature,
+                "suggested_tool": "query_usage",
+                "suggested_args": {
+                    "repo_name": s.repo_name,
+                    "query": s.name,
+                },
+            }
+            if s.repo_module:
+                d["suggested_args"]["module"] = s.repo_module
+            if s.is_exported:
+                d["is_exported"] = True
+            results.append(d)
+
+        return {"results": results, "total": len(results)}
 
     def get_module_dependencies(self, repo_name: str) -> list[dict]:
         """Analyze cross-module dependencies based on import statements.
@@ -278,4 +377,13 @@ class StructureQuery:
             d["repo_module"] = sym.repo_module
         if sym.docstring:
             d["docstring"] = sym.docstring
+        if sym.is_exported:
+            d["is_exported"] = True
+        return d
+
+    def _symbol_to_summary_dict(self, sym: Symbol) -> dict:
+        """Compact symbol representation for summary mode."""
+        d: dict = {"name": sym.name, "type": sym.kind}
+        if sym.is_exported:
+            d["is_exported"] = True
         return d

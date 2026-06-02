@@ -32,6 +32,8 @@ Use `search_code` only when you need to find specific code snippets, definitions
 
 Use `find_symbol` when you know a symbol name but not which repo/module it belongs to. Returns the symbol's repo_name and module so you can call other tools.
 
+Use `resolve_keyword` when you have an ambiguous keyword and don't know if it's a repo, module, or symbol. Returns all matches with type and suggested follow-up tool.
+
 Use `list_doc_index` + `read_doc` for reading specific documentation files by path.
 
 Key principle: Documentation first, code second."""
@@ -132,6 +134,25 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
                 },
             ),
             types.Tool(
+                name="resolve_keyword",
+                description=(
+                    "Resolve an ambiguous keyword to determine if it's a repo name, module name, or symbol name. "
+                    "Use when you encounter a keyword but don't know what type of entity it is. "
+                    "Returns all matches with type indicator (repo/module/symbol) and suggested follow-up tool. "
+                    "Example: resolve_keyword(keyword='biz_ui') or resolve_keyword(keyword='ColumnFreezingList')"
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "keyword": {
+                            "type": "string",
+                            "description": "Keyword to resolve (exact match against repo names, module names, and symbol names)",
+                        },
+                    },
+                    "required": ["keyword"],
+                },
+            ),
+            types.Tool(
                 name="search_code",
                 description="Semantic code search across repositories. Use for finding specific code, definitions, or searching by content. For usage questions, prefer query_usage.",
                 inputSchema={
@@ -180,7 +201,12 @@ def _create_server(config: Optional[CodekbYamlConfig] = None) -> Server:
             ),
             types.Tool(
                 name="get_structure",
-                description="Get code structure (classes, functions, signatures).",
+                description=(
+                    "Get code structure (classes, functions, signatures). "
+                    "Two-level query: without 'path' returns a compact summary grouped by file "
+                    "(each symbol only has name + type); with 'path' returns full symbol details "
+                    "(signature, line numbers, parent, docstring)."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -604,6 +630,9 @@ async def _handle_tool(
             "total": len(results),
         }
 
+    elif name == "resolve_keyword":
+        return structure_query.resolve_keyword(arguments["keyword"])
+
     elif name == "search_code":
         query = arguments["query"]
         repo_name = arguments.get("repo_name")
@@ -638,16 +667,6 @@ async def _handle_tool(
             path=arguments.get("path"),
             repo_module=arguments.get("module"),
         )
-        # Truncate large results to avoid exceeding token limits
-        if isinstance(result, list) and len(result) > 20:
-            total = len(result)
-            result = result[:20]
-            result.append({
-                "file": f"... and {total - 20} more files",
-                "symbols": [],
-                "truncated": True,
-                "hint": "Use 'path' or 'module' parameter to narrow results",
-            })
         return result
 
     elif name == "get_symbol_detail":

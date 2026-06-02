@@ -328,6 +328,17 @@ Return ONLY a JSON array, each element with:
         if cached is not None:
             return cached
 
+        # Check if library_name matches a module with a README
+        readme_content = self._try_read_module_readme(repo_name, library_name)
+        if readme_content:
+            result = {
+                "library_name": library_name,
+                "source": "readme",
+                "guide": {"description": readme_content},
+            }
+            self.cache.set(repo_name, tool_type, library_name, result, module=module or "")
+            return result
+
         file_tree = self.store.get_file_tree(repo_name, repo_module=module)
         export_files = [
             f for f in file_tree
@@ -380,10 +391,35 @@ Return ONLY a JSON array, each element with:
                 "example": None,
             }
 
-        result = {"library_name": library_name, "guide": guide}
+        result = {"library_name": library_name, "source": "llm_generated", "guide": guide}
         result = _truncate_result(result, tool_type)
         self.cache.set(repo_name, tool_type, library_name, result, module=module or "")
         return result
+
+    def _try_read_module_readme(self, repo_name: str, library_name: str) -> Optional[str]:
+        """Try to read a module's README if library_name matches a module name."""
+        from pathlib import Path
+
+        modules_data = self.store.get_repo_modules(repo_name)
+        module_path = None
+        for mod in modules_data:
+            if mod["name"] == library_name:
+                module_path = mod.get("path", "")
+                break
+
+        if module_path is None:
+            return None
+
+        repo = self.store.get_repo(repo_name)
+        if repo is None:
+            return None
+
+        module_dir = Path(repo.local_path) / module_path
+        for name in ["README.md", "README.rst", "README.txt", "README"]:
+            readme = module_dir / name
+            if readme.exists():
+                return readme.read_text(encoding="utf-8", errors="replace")
+        return None
 
     def _build_api_guide_prompt(self, library_name, components, imports, export_files):
         comp_str = "\n".join(f"  - {c['name']} ({c['kind']})" for c in components[:30])

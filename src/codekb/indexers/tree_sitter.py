@@ -1641,7 +1641,7 @@ class TreeSitterIndexer:
                 all_imports.extend(file_stats["imports"])
 
                 # Record file entry
-                is_entry = filepath.stem in ENTRY_POINT_NAMES
+                is_entry = filepath.stem.lower() in ENTRY_POINT_NAMES
                 self.store.upsert_file_entry(FileEntry(
                     repo_name=repo_name,
                     path=rel_path,
@@ -1660,6 +1660,9 @@ class TreeSitterIndexer:
         self.store.insert_symbols(all_symbols)
         self.store.insert_calls(all_calls)
         self.store.insert_imports(all_imports)
+
+        # Resolve module exports to mark public API symbols
+        self._resolve_exports(repo_name, repo_path, modules)
 
         return stats
 
@@ -1734,7 +1737,246 @@ class TreeSitterIndexer:
             repo_name=repo_name,
             path=rel_path,
             language=lang_name,
-            is_entry_point=file_path.stem in ENTRY_POINT_NAMES,
+            is_entry_point=file_path.stem.lower() in ENTRY_POINT_NAMES,
             symbol_count=len(file_data["symbols"]),
             repo_module=repo_module,
         ))
+
+    # --- Export resolution (public API marking) ---
+
+    _ENTRY_FILE_CANDIDATES = ["Index.ets", "index.ets", "Index.ts", "index.ts", "index.js"]
+
+    def _resolve_exports(
+        self,
+        repo_name: str,
+        repo_path: Path,
+        modules: list[ModuleInfo] | None,
+    ):
+        """Top-level entry: resolve exports for each module (or root)."""
+        if modules:
+            for mod in modules:
+                module_dir = repo_path / mod.path if mod.path else repo_path
+                self._resolve_exports_for_module(
+                    repo_name, repo_path, mod.name, module_dir,
+                )
+        else:
+            # Single-module repo: check root for entry file
+            self._resolve_exports_for_module(repo_name, repo_path, "", repo_path)
+
+    def _resolve_exports_for_module(
+        self,
+        repo_name: str,
+        repo_path: Path,
+        repo_module: str,
+        module_dir: Path,
+    ):
+        """Find entry file, parse exports, mark exported symbols."""
+        entry = self._find_entry_file(module_dir)
+        if entry is None:
+            return
+
+        try:
+            source = entry.read_bytes()
+        except OSError:
+            return
+
+        # Determine parser for entry file
+        ext = entry.suffix.lower()
+        result = self._get_strategy(ext)
+        if result is None:
+            return
+        lang_name, strategy = result
+        parser = self._parsers[lang_name]
+        tree = parser.parse(source)
+
+        exports = self._extract_exports_from_entry(tree.root_node, source)
+        if not exports:
+            return
+
+        updates = self._resolve_export_paths(exports, repo_path, module_dir)
+        if updates:
+            self.store.mark_symbols_exported(repo_name, updates)
+
+    def _find_entry_file(self, module_dir: Path) -> Path | None:
+        """Find module entry file (Index.ets, index.ts, etc.)."""
+        for name in self._ENTRY_FILE_CANDIDATES:
+            candidate = module_dir / name
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _extract_exports_from_entry(
+        self, node: ts.Node, source: bytes,
+    ) -> list[dict]:
+        """Parse export statements from an entry file.
+
+        Returns list of:
+          {"type": "named", "names": ["A","B"], "from": "./path"}
+          {"type": "wildcard", "from": "./path"}
+        """
+        exports: list[dict] = []
+        for child in node.children:
+            if child.type != "export_statement":
+                continue
+
+            # Check for wildcard: export * from './path'
+            has_asterisk = any(
+                c.type == "*"
+                or (c.type == "identifier" and bytes(c.text) == b"*")
+                for c in child.children
+            )
+
+            # Extract from path
+            from_path = ""
+            for c in child.children:
+                if c.type == "string":
+                    raw = bytes(c.text).decode("utf-8", errors="replace")
+                    # Strip quotes
+                    from_path = raw.strip("\"'").strip()
+                    break
+
+            if has_asterisk:
+                if from_path:
+                    exports.append({"type": "wildcard", "from": from_path})
+            else:
+                # Named export: export { A, B } from './path'
+                names: list[str] = []
+                for c in child.children:
+                    if c.type == "export_clause":
+                        for spec in c.children:
+                            if spec.type == "export_specifier":
+                                # export_specifier has identifier children
+                                for sc in spec.children:
+                                    if sc.type == "identifier":
+                                        names.append(
+                                            bytes(sc.text).decode("utf-8", errors="replace")
+                                        )
+                                        break
+                if names:
+                    exports.append({"type": "named", "names": names, "from": from_path})
+
+        return exports
+
+    def _resolve_export_paths(
+        self,
+        exports: list[dict],
+        repo_path: Path,
+        module_dir: Path,
+    ) -> list[tuple[str, str]]:
+        """Resolve export from-paths to (rel_file_path, symbol_name) pairs."""
+        updates: list[tuple[str, str]] = []
+
+        for exp in exports:
+            from_rel = exp.get("from", "")
+            if not from_rel:
+                continue
+
+            # Resolve relative path to actual file
+            target_dir = (module_dir / from_rel).resolve()
+            target_file = self._resolve_target_file(target_dir)
+            if target_file is None:
+                continue
+
+            rel_path = str(target_file.relative_to(repo_path))
+
+            if exp["type"] == "named":
+                for name in exp["names"]:
+                    updates.append((rel_path, name))
+            elif exp["type"] == "wildcard":
+                # Resolve all exported symbols from the target file
+                names = self._get_file_exported_symbols(target_file)
+                for name in names:
+                    updates.append((rel_path, name))
+
+        return updates
+
+    def _resolve_target_file(self, target_path: Path) -> Path | None:
+        """Try to resolve a from-path to an actual file.
+
+        Handles cases like './components/TitleBar' → TitleBar.ets / TitleBar.ts / TitleBar.js
+        Also handles directory paths like './components' → components/Index.ets
+        """
+        # Try exact match first
+        if target_path.is_file():
+            return target_path
+
+        # Try with extensions
+        for ext in [".ets", ".ts", ".js", ".tsx", ".jsx"]:
+            candidate = Path(str(target_path) + ext)
+            if candidate.exists():
+                return candidate
+
+        # Try as directory (look for index file)
+        if target_path.is_dir():
+            for name in self._ENTRY_FILE_CANDIDATES:
+                candidate = target_path / name
+                if candidate.exists():
+                    return candidate
+
+        return None
+
+    def _get_file_exported_symbols(self, file_path: Path) -> list[str]:
+        """Parse a file to find all top-level exported symbol names.
+
+        Handles:
+          export function foo() {}
+          export class Foo {}
+          export interface Bar {}
+          export enum Baz {}
+          export { A, B }
+          export struct Qux {}  (ArkTS)
+        """
+        ext = file_path.suffix.lower()
+        result = self._get_strategy(ext)
+        if result is None:
+            return []
+        lang_name, strategy = result
+
+        try:
+            source = file_path.read_bytes()
+        except OSError:
+            return []
+
+        parser = self._parsers[lang_name]
+        tree = parser.parse(source)
+        names: list[str] = []
+
+        for child in tree.root_node.children:
+            if child.type == "export_statement":
+                for sub in child.children:
+                    # export function/class/interface/enum/struct
+                    if sub.type in (
+                        "function_declaration",
+                        "class_declaration",
+                        "interface_declaration",
+                        "enum_declaration",
+                        "struct_declaration",
+                        "lexical_declaration",
+                        "variable_declaration",
+                    ):
+                        name_node = sub.child_by_field_name("name")
+                        if name_node:
+                            names.append(
+                                bytes(name_node.text).decode("utf-8", errors="replace")
+                            )
+                        elif sub.type in ("lexical_declaration", "variable_declaration"):
+                            # export const foo = ...
+                            for decl in sub.children:
+                                if decl.type == "variable_declarator":
+                                    vn = decl.child_by_field_name("name")
+                                    if vn:
+                                        names.append(
+                                            bytes(vn.text).decode("utf-8", errors="replace")
+                                        )
+                    # export { A, B }
+                    elif sub.type == "export_clause":
+                        for spec in sub.children:
+                            if spec.type == "export_specifier":
+                                for sc in spec.children:
+                                    if sc.type == "identifier":
+                                        names.append(
+                                            bytes(sc.text).decode("utf-8", errors="replace")
+                                        )
+                                        break
+
+        return names

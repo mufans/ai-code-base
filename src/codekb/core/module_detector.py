@@ -22,10 +22,18 @@ _MANIFEST_FILES = {
     "build.gradle",
     "Gemfile",
     "composer.json",
+    "oh-package.json5",
 }
 
 # Common monorepo top-level directory names (frontend/backend split etc.)
 _COMMON_MODULE_DIRS = {"frontend", "backend", "server", "client", "web", "api", "admin", "mobile", "desktop"}
+
+# Directories to skip during module scanning
+_SKIP_DIRS = {
+    "node_modules", "__pycache__", "dist", "build", "vendor",
+    "target", ".git", ".github", "docs", "tests", "test", "scripts",
+    "configs", "config", "data", "assets", "public", "static",
+}
 
 
 @dataclass
@@ -126,11 +134,7 @@ def _auto_detect(repo_path: Path) -> list[ModuleInfo]:
         if not child.is_dir():
             continue
         # Skip common non-module dirs
-        if child.name.startswith(".") or child.name in {
-            "node_modules", "__pycache__", "dist", "build", "vendor",
-            "target", ".git", ".github", "docs", "tests", "test", "scripts",
-            "configs", "config", "data", "assets", "public", "static",
-        }:
+        if child.name.startswith(".") or child.name in _SKIP_DIRS:
             continue
 
         manifest = _find_manifest(child)
@@ -142,6 +146,22 @@ def _auto_detect(repo_path: Path) -> list[ModuleInfo]:
                 manifest_file=manifest.name,
                 source="auto",
             ))
+        else:
+            # Strategy 2b: Scan one level deeper (e.g. bizCommon/biz_ui/oh-package.json5)
+            for grandchild in sorted(child.iterdir()):
+                if not grandchild.is_dir():
+                    continue
+                if grandchild.name.startswith(".") or grandchild.name in _SKIP_DIRS:
+                    continue
+                manifest = _find_manifest(grandchild)
+                if manifest:
+                    modules.append(ModuleInfo(
+                        name=grandchild.name,
+                        path=str(grandchild.relative_to(repo_path)),
+                        language=_guess_language(manifest),
+                        manifest_file=manifest.name,
+                        source="auto",
+                    ))
 
     if modules:
         return modules
@@ -186,4 +206,6 @@ def _guess_language(manifest: Path) -> str:
         return "ruby"
     if name == "composer.json":
         return "php"
+    if name == "oh-package.json5":
+        return "typescript"
     return ""
