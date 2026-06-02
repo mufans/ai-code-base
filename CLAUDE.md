@@ -24,18 +24,23 @@ python -m pytest tests/ -v
 ## Architecture
 
 - **Entry point**: `src/codekb/cli/main.py` (Typer CLI app)
-- **MCP server**: `src/codekb/mcp/server.py` (14 tools + resources)
+- **MCP server**: `src/codekb/mcp/server.py` (17 tools + resources)
 - **Index orchestrator**: `src/codekb/core/indexer.py` (coordinates tree-sitter + embedding)
 - **Storage**: SQLite (metadata.db + structure.db) + ChromaDB (vectors) + Markdown files (docs)
 
 ## Key Patterns
 
 - Config loading: `CodekbYamlConfig` from YAML + `Settings` from .env (pydantic-settings)
+- Multi-provider LLM: `llm_providers` dict in YAML config, litellm format (openai, deepseek, etc.)
 - Services instantiated via `_get_services()` in CLI and MCP server
 - Tree-sitter uses `LanguageStrategy` protocol per language (Python, JavaScript implemented)
 - Embedding providers implement `EmbeddingProvider` protocol (sentence-transformers, OpenAI)
 - All query-time operations are zero-LLM (pure retrieval from pre-built indexes)
-- LLM calls only during index building (doc generation, skill generation)
+- LLM calls only during index building (doc generation, skill generation) and guide generation
+- Cross-repo symbol search: `find_symbol_across_repos` in SqliteStore, `find_symbol`/`resolve_symbol` in StructureQuery
+- `repo_name` auto-resolution: `query_usage`, `get_structure`, `get_symbol_detail` accept optional repo_name
+- Guide cache: `GuideCache` wrapper (`mcp/guide_cache.py`) caches LLM-generated guide results in metadata.db
+- Guide generator: `GuideGenerator` (`retrieval/guide_generator.py`) produces component/API/usage guides via LLM
 
 ## Code Style
 
@@ -46,9 +51,10 @@ python -m pytest tests/ -v
 
 ## File Conventions
 
-- Storage models in `storage/sqlite_store.py` (Pydantic + SQLite operations)
+- Storage models in `storage/sqlite_store.py` (Pydantic + SQLite operations, incl. guide_cache table)
 - Indexer modules in `indexers/` (tree_sitter, embedder, doc_generator, skill_generator)
-- Retrieval modules in `retrieval/` (semantic_search, structure_query, hybrid_search, reference_builder)
+- Retrieval modules in `retrieval/` (semantic_search, structure_query, hybrid_search, reference_builder, guide_generator)
+- MCP modules in `mcp/` (server.py, guide_cache.py)
 - All subpackages have `__init__.py`
 
 ## Data Directory

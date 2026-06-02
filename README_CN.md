@@ -144,21 +144,39 @@ codekb skills review <name> <skill> [--approve/--reject]
 
 ## MCP 工具列表
 
+**17 个工具**，分为 4 个类别：
+
+### 查询工具（核心入口）
+
+| 工具 | 说明 |
+|------|------|
+| `query_usage` | 主要的「如何使用」查询工具 — 自动遵循文档优先链：README → API 指南 → 组件指南 → 用法示例 → 推荐 |
+| `find_symbol` | 跨仓库搜索符号归属（查找符号所在的仓库和模块） |
+| `resolve_keyword` | 解析模糊关键词为仓库/模块/符号类型 |
+| `search_code` | 跨仓库语义代码搜索 |
+
+### 管理与元数据
+
 | 工具 | 说明 |
 |------|------|
 | `list_repos` | 列出所有已索引仓库 |
 | `get_repo_info` | 获取仓库详细信息 |
-| `search_code` | 语义代码搜索 |
-| `get_structure` | 代码结构（类、函数、签名） |
-| `get_symbol_detail` | 符号完整定义 + 调用图 |
+| `list_modules` | 列出仓库中的模块（monorepo 支持） |
+| `get_module_dependencies` | 跨模块依赖关系 |
+| `get_structure` | 代码结构（类、函数、签名）；`repo_name` 可选 |
+| `get_symbol_detail` | 符号完整定义 + 调用图；`repo_name` 可选 |
 | `get_file_content` | 读取文件内容 |
-| `get_readme` | 获取 README 内容 |
+
+### 文档与技能
+
+| 工具 | 说明 |
+|------|------|
 | `get_architecture` | 获取生成的架构文档 |
-| `get_usage_examples` | 真实代码模式示例 |
-| `get_integration_guide` | 库集成指南 |
-| `get_code_template` | 项目代码模板 |
+| `get_code_template` | 获取项目代码模板 |
 | `list_skills` | 列出可用的 Agent 技能 |
 | `get_skill` | 获取技能完整内容 |
+| `list_doc_index` | 列出文档索引（仅元数据） |
+| `read_doc` | 按路径读取 Markdown 文档全文 |
 
 ## 项目结构
 
@@ -166,7 +184,7 @@ codekb skills review <name> <skill> [--approve/--reject]
 src/codekb/
   cli/main.py           # Typer CLI 命令行
   core/
-    config.py           # YAML + .env 配置加载
+    config.py           # YAML + .env 配置加载（多 Provider）
     repo_manager.py     # 仓库克隆、注册、元数据
     indexer.py          # 索引编排器（全量/增量）
   indexers/
@@ -175,15 +193,18 @@ src/codekb/
     doc_generator.py    # LLM 文档生成 + 质量验证
     skill_generator.py  # 技能生成 + 自动验证
   storage/
-    sqlite_store.py     # SQLite 元数据 + 结构存储
+    sqlite_store.py     # SQLite 元数据 + 结构存储（含 guide_cache）
     vector_store.py     # ChromaDB 向量操作
     doc_store.py        # Markdown 文件存储
   retrieval/
     semantic_search.py  # 向量语义搜索
-    structure_query.py  # 结构化 SQLite 查询
+    structure_query.py  # 结构化 SQLite 查询（含 find_symbol、resolve）
     hybrid_search.py    # RRF 混合搜索（向量 + 关键词）
     reference_builder.py # 用法示例、模板、指南
-  mcp/server.py         # MCP 服务（14 个工具 + 资源）
+    guide_generator.py  # LLM 驱动的指南生成（组件/API/示例）
+  mcp/
+    server.py           # MCP 服务（17 个工具 + 资源）
+    guide_cache.py      # 指南结果缓存层
   webhook/
     receiver.py         # FastAPI webhook 接收服务
     adapters/           # GitHub、GitLab、Gitee 适配器
@@ -202,6 +223,23 @@ src/codekb/
 | 结构化存储 | SQLite | 轻量级，单文件 |
 | LLM 接口 | litellm | 统一接口支持所有 LLM 提供商 |
 | 嵌入模型 | 可插拔 | 默认 sentence-transformers，可选 OpenAI |
+
+**多 Provider 配置** — `codekb.yaml` 支持通过 litellm 格式配置多个 LLM/Embedding 提供商：
+
+```yaml
+codekb:
+  llm_providers:
+    openai:
+      provider: openai
+      base_url: https://api.openai.com/v1
+      model: gpt-4o-mini
+    deepseek:
+      provider: openai
+      base_url: https://api.deepseek.com/v1
+      model: deepseek-chat
+  assignments:
+    doc_generation: openai
+```
 | 配置管理 | pydantic-settings | 类型安全，.env 支持 |
 
 ## 运行测试
@@ -211,7 +249,7 @@ source .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
-共 61 个测试，覆盖配置、存储、tree-sitter 解析、webhook 和完整集成流程。
+共 86 个测试，覆盖配置、存储、tree-sitter 解析、guide 缓存/生成、webhook 和完整集成流程。
 
 ## 许可证
 
