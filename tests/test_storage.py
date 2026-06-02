@@ -248,6 +248,34 @@ class TestSqliteStore:
         backend_calls = sqlite_store.get_calls_to("test", "qux", repo_module="backend")
         assert len(backend_calls) == 1
 
+    def test_find_symbol_across_repos(self, sqlite_store):
+        """Test cross-repo symbol search."""
+        sqlite_store.insert_symbols([
+            Symbol(repo_name="repo-a", file_path="svc.py", name="QuoteService",
+                   kind="class", signature="class QuoteService:",
+                   start_line=1, end_line=10, language="python",
+                   repo_module="quote_service"),
+            Symbol(repo_name="repo-b", file_path="util.py", name="QuoteService",
+                   kind="class", signature="class QuoteService:",
+                   start_line=5, end_line=20, language="python"),
+            Symbol(repo_name="repo-a", file_path="other.py", name="OtherClass",
+                   kind="class", start_line=1, end_line=5, language="python"),
+        ])
+        results = sqlite_store.find_symbol_across_repos("QuoteService")
+        assert len(results) == 2
+        assert results[0].repo_name == "repo-a"
+        assert results[0].repo_module == "quote_service"
+        assert results[1].repo_name == "repo-b"
+
+    def test_find_symbol_across_repos_no_match(self, sqlite_store):
+        """Test cross-repo search with no matches."""
+        sqlite_store.insert_symbols([
+            Symbol(repo_name="repo-a", file_path="a.py", name="Foo",
+                   kind="class", start_line=1, end_line=1, language="python"),
+        ])
+        results = sqlite_store.find_symbol_across_repos("NonExistent")
+        assert results == []
+
 
 class TestDocIndex:
     def test_index_docs(self, sqlite_store, tmp_path):

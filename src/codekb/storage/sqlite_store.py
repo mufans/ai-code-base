@@ -355,6 +355,16 @@ class SqliteStore:
         conn.close()
         return [Symbol(**dict(r)) for r in rows]
 
+    def find_symbol_across_repos(self, name: str) -> list[Symbol]:
+        """Cross-repo exact symbol search by name."""
+        conn = self._connect(self._struct_path)
+        rows = conn.execute(
+            "SELECT * FROM symbols WHERE name = ? ORDER BY repo_name, repo_module",
+            (name,),
+        ).fetchall()
+        conn.close()
+        return [Symbol(**dict(r)) for r in rows]
+
     def delete_symbols_for_file(self, repo_name: str, file_path: str):
         conn = self._connect(self._struct_path)
         conn.execute(
