@@ -223,6 +223,7 @@ src/codekb/
 | Structured storage | SQLite | Lightweight, single-file |
 | LLM interface | litellm | Unified interface for all providers |
 | Embedding | Pluggable | Default sentence-transformers, optional OpenAI |
+| Config | pydantic-settings | Type-safe config, .env support |
 
 **Multi-Provider Config** — `codekb.yaml` supports multiple LLM/embedding providers via litellm format:
 
@@ -240,7 +241,6 @@ codekb:
   assignments:
     doc_generation: openai
 ```
-| Config | pydantic-settings | Type-safe config, .env support |
 
 ## Testing
 

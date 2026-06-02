@@ -223,6 +223,7 @@ src/codekb/
 | 结构化存储 | SQLite | 轻量级，单文件 |
 | LLM 接口 | litellm | 统一接口支持所有 LLM 提供商 |
 | 嵌入模型 | 可插拔 | 默认 sentence-transformers，可选 OpenAI |
+| 配置管理 | pydantic-settings | 类型安全，.env 支持 |
 
 **多 Provider 配置** — `codekb.yaml` 支持通过 litellm 格式配置多个 LLM/Embedding 提供商：
 
@@ -240,7 +241,6 @@ codekb:
   assignments:
     doc_generation: openai
 ```
-| 配置管理 | pydantic-settings | 类型安全，.env 支持 |
 
 ## 运行测试
 
